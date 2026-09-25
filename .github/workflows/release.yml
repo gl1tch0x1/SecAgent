@@ -275,6 +275,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [validate-release, build-binaries, build-docker]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    env:
+      RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+      RELEASE_GPG_KEY_ID: ${{ secrets.RELEASE_GPG_KEY_ID }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -294,18 +297,14 @@ jobs:
           ls -lh
 
       - name: Import release signing key
-        if: ${{ secrets.RELEASE_GPG_PRIVATE_KEY != '' }}
-        env:
-          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+        if: env.RELEASE_GPG_PRIVATE_KEY != ''
         run: |
           mkdir -p ~/.gnupg
           chmod 700 ~/.gnupg
           echo "$RELEASE_GPG_PRIVATE_KEY" | gpg --batch --import
 
       - name: Sign release assets
-        if: ${{ secrets.RELEASE_GPG_PRIVATE_KEY != '' }}
-        env:
-          RELEASE_GPG_KEY_ID: ${{ secrets.RELEASE_GPG_KEY_ID }}
+        if: env.RELEASE_GPG_PRIVATE_KEY != ''
         shell: bash
         run: |
           cd release-assets
@@ -318,7 +317,7 @@ jobs:
           gpg --batch --yes --armor --pinentry-mode loopback --detach-sign --local-user "$USER_ID" SHA256SUMS.txt
 
       - name: Skip release signing when key not configured
-        if: ${{ secrets.RELEASE_GPG_PRIVATE_KEY == '' }}
+        if: env.RELEASE_GPG_PRIVATE_KEY == ''
         run: echo "Release artifact signing skipped because RELEASE_GPG_PRIVATE_KEY is not configured."
 
       - name: Create Release
