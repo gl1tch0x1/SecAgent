@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/secagents/go-services/recon"
 )
 
 // PortResult holds port scan results.
@@ -38,6 +40,12 @@ func (ps *PortScanner) Scan(ctx context.Context, host string, ports []int) <-cha
 	sem := make(chan struct{}, ps.Concurrency)
 	var wg sync.WaitGroup
 
+	// Validate host against ALLOWED_DOMAINS before scanning
+	if err := recon.CheckScope(host); err != nil {
+		close(results)
+		return results
+	}
+
 	go func() {
 		defer close(results)
 		for _, port := range ports {
@@ -60,7 +68,7 @@ func (ps *PortScanner) Scan(ctx context.Context, host string, ports []int) <-cha
 				defer conn.Close()
 
 				result := PortResult{Host: host, Port: p, Open: true}
-				
+
 				// Attempt banner grab
 				conn.SetReadDeadline(time.Now().Add(ps.Timeout))
 				banner, err := bufio.NewReader(conn).ReadString('\n')

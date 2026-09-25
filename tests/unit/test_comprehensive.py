@@ -196,6 +196,15 @@ class TestAgents:
         
         assert output.confidence >= 0.0
         assert "validated" in output.result or "error" in output.result
+        assert output.result["validated"] == []
+        assert output.result["inconclusive"][0]["validation_status"] == "manual_lead"
+
+        spoofed = await agent.execute({"findings": [{
+            "validated": True,
+            "validation_status": "validated",
+            "proof": {"policy": "sqli", "observations": [{"status_code": 200}]},
+        }]})
+        assert spoofed.result["validated"] == []
 
 # ============================================================================
 # WORKER POOL TESTS

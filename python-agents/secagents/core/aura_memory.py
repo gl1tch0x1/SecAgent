@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,11 +73,14 @@ class AuraMemoryManager:
         """Attempt to load aura-memory SDK if installed."""
         try:
             import aura_memory  # type: ignore[import-not-found]
+
             self._aura_sdk = aura_memory.MemoryEngine()
             self._sdk_available = True
             self.logger.info("AuraMemoryManager: Loaded official aura-memory SDK engine")
         except ImportError:
-            self.logger.info("AuraMemoryManager: Operating in native embedded cognitive memory mode")
+            self.logger.info(
+                "AuraMemoryManager: Operating in native embedded cognitive memory mode"
+            )
 
     def _init_sqlite_schema(self) -> None:
         """Initialize local SQLite persistence tables."""
@@ -151,7 +153,10 @@ class AuraMemoryManager:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM target_dna WHERE target = ? OR domain = ?", (target, clean_target))
+                cursor.execute(
+                    "SELECT * FROM target_dna WHERE target = ? OR domain = ?",
+                    (target, clean_target),
+                )
                 row = cursor.fetchone()
                 if row:
                     return TargetDNA(
@@ -184,7 +189,10 @@ class AuraMemoryManager:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT occurrences, confidence FROM cognitive_patterns WHERE pattern_id = ?", (pattern_id,))
+                cursor.execute(
+                    "SELECT occurrences, confidence FROM cognitive_patterns WHERE pattern_id = ?",
+                    (pattern_id,),
+                )
                 existing = cursor.fetchone()
 
                 if existing:
@@ -196,7 +204,14 @@ class AuraMemoryManager:
                         SET occurrences = ?, confidence = ?, waf_bypassed = ?, last_verified = ?, metadata = ?
                         WHERE pattern_id = ?
                     """,
-                        (occurrences, new_confidence, 1 if waf_bypassed else 0, now, json.dumps(meta), pattern_id),
+                        (
+                            occurrences,
+                            new_confidence,
+                            1 if waf_bypassed else 0,
+                            now,
+                            json.dumps(meta),
+                            pattern_id,
+                        ),
                     )
                 else:
                     cursor.execute(
@@ -204,7 +219,17 @@ class AuraMemoryManager:
                         INSERT INTO cognitive_patterns (pattern_id, target, vuln_type, payload, waf_bypassed, confidence, occurrences, last_verified, metadata)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                        (pattern_id, target, vuln_type, payload, 1 if waf_bypassed else 0, confidence, 1, now, json.dumps(meta)),
+                        (
+                            pattern_id,
+                            target,
+                            vuln_type,
+                            payload,
+                            1 if waf_bypassed else 0,
+                            confidence,
+                            1,
+                            now,
+                            json.dumps(meta),
+                        ),
                     )
                 conn.commit()
             self.logger.info(f"Crystallized pattern {pattern_id} for {target}")
@@ -213,7 +238,9 @@ class AuraMemoryManager:
 
         return pattern_id
 
-    def recall_patterns_for_target(self, target: str, vuln_type: Optional[str] = None) -> List[CognitivePattern]:
+    def recall_patterns_for_target(
+        self, target: str, vuln_type: Optional[str] = None
+    ) -> List[CognitivePattern]:
         """Recall high-confidence crystallized patterns for a given target."""
         patterns: List[CognitivePattern] = []
         try:
@@ -256,7 +283,10 @@ class AuraMemoryManager:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("UPDATE cognitive_patterns SET confidence = confidence * 0.8 WHERE last_verified < ?", (cutoff,))
+                cursor.execute(
+                    "UPDATE cognitive_patterns SET confidence = confidence * 0.8 WHERE last_verified < ?",
+                    (cutoff,),
+                )
                 cursor.execute("DELETE FROM cognitive_patterns WHERE confidence < 0.2")
                 purged = cursor.rowcount
                 conn.commit()

@@ -3,13 +3,13 @@
 import asyncio
 import logging
 import os
-import re
-import time
 from typing import Optional
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from secagents.agents.base import BaseAgent, AgentConfig, AgentOutput, AgentRole
 from secagents.prompts import WEB_SECURITY_PROMPT
+from secagents.infra.execution_budget import BudgetExceeded, ExecutionBudget
 from secagents.infra.scope import enforce_scope, ScopeViolationError
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class WebSecurityAgent(BaseAgent):
     - Generate context-aware payloads
     - Test multiple vulnerability types
     - Validate findings with response analysis
-    - Minimize false positives using linear-scaling time-based verification
+    - Record signature matches as manual leads pending typed proof
     """
 
     # Vulnerability detection signatures - Enhanced with 20+ classes
@@ -89,28 +89,6 @@ class WebSecurityAgent(BaseAgent):
                 "....//....//....//etc/passwd",
                 "%2e%2e%2fetc%2fpasswd",
                 "C:\\Windows\\win.ini",
-            ],
-        },
-        "ssrf": {
-            "patterns": [
-                r"ami-id",
-                r"instance-id",
-                r"iam/security-credentials",
-                r"metadata",
-                r"169\.254\.169\.254",
-            ],
-            "payloads": [
-                "http://169.254.169.254/latest/meta-data/",
-                "http://2130706433",  # Decimal IP
-                "http://0177.0.0.1",  # Octal IP
-                "http://0x7f.0x0.0x0.0x1",  # Hex IP
-                "http://127.1",  # Short IP
-                "http://[::1]",  # IPv6
-                "http://[::ffff:127.0.0.1]",  # IPv6 mapped
-                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-                "http://attacker.com#@127.0.0.1",  # URL parser confusion
-                "http://[::ffff:0x7f000001]",  # Mixed hex IPv6
-                "http://local.gd",  # DNS Rebinding (example)
             ],
         },
         "rce": {
@@ -188,7 +166,12 @@ class WebSecurityAgent(BaseAgent):
         ],
     }
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        budget: ExecutionBudget | None = None,
+        auth_headers: dict[str, str] | None = None,
+    ):
         super().__init__(
             AgentConfig(
                 role=AgentRole.WEB_SECURITY,
@@ -199,6 +182,9 @@ class WebSecurityAgent(BaseAgent):
         )
         self.logger = logging.getLogger("secagents.web_security")
         self._client: Optional[httpx.AsyncClient] = None
+        self._owns_budget = budget is None
+        self.budget = budget or ExecutionBudget(max_requests=100, max_duration_seconds=120)
+        self.auth_headers = dict(auth_headers or {})
 
     def mutate_payload_for_waf(self, payload: str, vuln_type: str) -> list[str]:
         """Generate WAF evasion payload variants via encoding, comment injection, and obfuscation."""
@@ -207,7 +193,7 @@ class WebSecurityAgent(BaseAgent):
 
         # 1. URL double encoding
         mutations.append(urllib.parse.quote(urllib.parse.quote(payload)))
-        
+
         # 2. SQLi specific comment obfuscation
         if vuln_type == "sqli":
             mutations.append(payload.replace(" ", "/**/"))
@@ -218,7 +204,9 @@ class WebSecurityAgent(BaseAgent):
         elif vuln_type == "xss":
             mutations.append(payload.replace("<", "%3C").replace(">", "%3E"))
             mutations.append(payload.replace("alert", "prompt").replace("1", "document.domain"))
-            mutations.append(f"<svg/onload={payload.replace('<script>', '').replace('</script>', '')}>")
+            mutations.append(
+                f"<svg/onload={payload.replace('<script>', '').replace('</script>', '')}>"
+            )
 
         # 4. Command Injection obfuscation
         elif vuln_type in ("rce", "cmdi"):
@@ -232,7 +220,12 @@ class WebSecurityAgent(BaseAgent):
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
             verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
-            self._client = httpx.AsyncClient(timeout=10.0, follow_redirects=True, verify=verify_ssl)
+            self._client = httpx.AsyncClient(
+                timeout=10.0,
+                follow_redirects=False,
+                verify=verify_ssl,
+                headers=self.auth_headers,
+            )
         return self._client
 
     def base_system_prompt(self) -> str:
@@ -242,13 +235,17 @@ class WebSecurityAgent(BaseAgent):
     async def execute(self, task: dict) -> AgentOutput:
         """Execute web vulnerability scanning."""
         target = task.get("target", "")
-        endpoints = task.get("endpoints", [])
-        vuln_types = task.get("vuln_types", list(self.VULN_SIGNATURES.keys()))
+        endpoints = task.get("endpoints", [])[:20]
+        requested_types = task.get("vuln_types", list(self.VULN_SIGNATURES.keys()))[:5]
+        unsupported_types = [key for key in requested_types if key not in self.VULN_SIGNATURES]
+        vuln_types = [key for key in requested_types if key in self.VULN_SIGNATURES]
+        if self._owns_budget:
+            self.budget = ExecutionBudget(max_requests=100, max_duration_seconds=120)
 
         if not endpoints:
             self.logger.error("No endpoints specified")
             return self._format_output(
-                result={"error": "endpoints required"},
+                result={"error": "endpoints required", "budget": self.budget.snapshot()},
                 confidence=0.0,
                 reasoning="No endpoints to test",
             )
@@ -256,7 +253,7 @@ class WebSecurityAgent(BaseAgent):
         self.logger.info(f"Testing {len(endpoints)} endpoints for {len(vuln_types)} vuln types")
 
         try:
-            findings = await self._test_endpoints(endpoints, vuln_types, target)
+            findings, scoped_count = await self._test_endpoints(endpoints, vuln_types, target)
 
             confidence = self._calculate_confidence(
                 evidence_count=len(findings),
@@ -266,9 +263,19 @@ class WebSecurityAgent(BaseAgent):
 
             result = {
                 "findings": findings,
-                "endpoints_tested": len(endpoints),
+                "endpoints_tested": scoped_count if vuln_types else 0,
                 "vuln_types_tested": len(vuln_types),
-                "total_payloads_sent": len(endpoints) * len(vuln_types),
+                "coverage_gaps": [
+                    {"vuln_type": key, "reason": "No supported specialist proof probe"}
+                    for key in unsupported_types
+                ]
+                + (
+                    [{"reason": "One or more endpoints were outside authorized scope"}]
+                    if scoped_count < len(endpoints)
+                    else []
+                ),
+                "total_requests_sent": self.budget.snapshot()["requests_used"],
+                "budget": self.budget.snapshot(),
             }
 
             self.logger.info(f"Found {len(findings)} potential vulnerabilities")
@@ -276,17 +283,17 @@ class WebSecurityAgent(BaseAgent):
             return self._format_output(
                 result=result,
                 confidence=confidence,
-                reasoning=f"Tested {len(endpoints)} endpoints for {len(vuln_types)} vuln types",
+                reasoning=f"Tested {scoped_count if vuln_types else 0} endpoints for {len(vuln_types)} vuln types",
                 metadata={
                     "target": target,
-                    "endpoint_count": len(endpoints),
+                    "endpoint_count": scoped_count if vuln_types else 0,
                     "vuln_type_count": len(vuln_types),
                 },
             )
         except Exception as e:
             self.logger.error(f"Web security scan failed: {str(e)}", exc_info=True)
             return self._format_output(
-                result={"error": str(e)},
+                result={"error": str(e), "budget": self.budget.snapshot()},
                 confidence=0.0,
                 reasoning="Scan execution failed",
             )
@@ -297,24 +304,26 @@ class WebSecurityAgent(BaseAgent):
 
     async def _test_endpoints(
         self, endpoints: list[str], vuln_types: list[str], target: str
-    ) -> list[dict]:
+    ) -> tuple[list[dict], int]:
         """Test multiple endpoints for vulnerabilities concurrently."""
         findings = []
         sem = asyncio.Semaphore(10)
 
-        # Validate all endpoints against ALLOWED_DOMAINS
+        # Resolve the final request URL before validating scope. Absolute inventory
+        # URLs must remain absolute; joining them to the target changes the host/path.
         scoped_endpoints = []
         for endpoint in endpoints:
             try:
-                enforce_scope(endpoint)
-                scoped_endpoints.append(endpoint)
+                url = self._resolve_endpoint(target, endpoint)
+                enforce_scope(url)
+                scoped_endpoints.append(url)
             except ScopeViolationError:
                 self.logger.debug(f"Endpoint {endpoint} filtered by scope policy")
                 continue
 
         if not scoped_endpoints:
             self.logger.warning("No endpoints passed scope validation")
-            return []
+            return [], 0
 
         async def _test_worker(endpoint: str, vuln_type: str):
             async with sem:
@@ -327,8 +336,21 @@ class WebSecurityAgent(BaseAgent):
             for endpoint in scoped_endpoints
             for vuln_type in vuln_types
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        return findings
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BudgetExceeded):
+                self.logger.info("Web security requests stopped: %s", result)
+            elif isinstance(result, Exception):
+                self.logger.warning("Web security probe failed: %s", result)
+        return findings, len(scoped_endpoints)
+
+    @staticmethod
+    def _resolve_endpoint(target: str, endpoint: str) -> str:
+        base = target if "://" in target else f"https://{target}"
+        parts = urlsplit(base)
+        directory = parts.path.rstrip("/") + "/"
+        base_url = urlunsplit((parts.scheme, parts.netloc, directory, "", ""))
+        return urljoin(base_url, endpoint)
 
     async def _test(self, endpoint: str, vuln_type: str, target: str) -> Optional[dict]:
         """Test a single endpoint for a vulnerability type."""
@@ -338,82 +360,47 @@ class WebSecurityAgent(BaseAgent):
             sig = self.VULN_SIGNATURES[vuln_type]
             baseline = await self._send_payload(endpoint, "safe_canary_value", target)
             for payload in sig.get("payloads", []):
+                if self.budget.snapshot()["termination_reason"]:
+                    break
                 response = await self._send_payload(endpoint, payload, target)
-                if response and self._check_response(response, sig.get("patterns", [])):
-                    # Compute dynamic confidence based on baseline divergence
-                    conf = 0.7
-                    if baseline and not self._check_response(baseline, sig.get("patterns", [])):
-                        conf += 0.2
-                    if len(response) != len(baseline or ""):
-                        conf += 0.05
-                    conf = min(round(conf, 2), 0.95)
-
+                if (
+                    response
+                    and baseline is not None
+                    and not self._check_response(baseline, sig.get("patterns", []))
+                    and self._check_response(response, sig.get("patterns", []))
+                ):
                     return {
                         "type": vuln_type,
                         "endpoint": endpoint,
                         "payload": payload,
-                        "poc_url": f"{target}{endpoint}?param={payload}",
-                        "confidence": conf,
+                        "validation_status": "manual_lead",
+                        "validated": False,
+                        "confidence": 0.5,
                         "severity": self._get_severity(vuln_type),
                         "cwe": self._get_cwe(vuln_type),
                         "method": "content-based",
                     }
 
-        # 2. Time-based testing (Linear Scaling)
-        if vuln_type in self.TIME_BASED_PAYLOADS:
-            time_finding = await self._test_time_based(endpoint, vuln_type, target)
-            if time_finding:
-                return time_finding
+        # Standalone timing heuristics lack independent controls and typed proof.
 
-        return None
-
-    async def _test_time_based(self, endpoint: str, vuln_type: str, target: str) -> Optional[dict]:
-        """Linear-scaling time-based verification."""
-        payloads = self.TIME_BASED_PAYLOADS[vuln_type]
-        delays = [2, 5]
-
-        for base_payload in payloads:
-            is_vulnerable = True
-            latencies = []
-
-            for delay in delays:
-                payload = base_payload.format(delay=delay)
-                start_time = time.time()
-                await self._send_payload(endpoint, payload, target)
-                latency = time.time() - start_time
-                latencies.append(latency)
-
-                if latency < delay:
-                    is_vulnerable = False
-                    break
-
-            if is_vulnerable and latencies[1] > latencies[0]:
-                return {
-                    "type": vuln_type,
-                    "endpoint": endpoint,
-                    "payload": base_payload.format(delay=delays[1]),
-                    "confidence": 0.95,
-                    "severity": self._get_severity(vuln_type),
-                    "cwe": self._get_cwe(vuln_type),
-                    "method": "time-based-linear",
-                    "latencies": latencies,
-                }
         return None
 
     async def _send_payload(self, endpoint: str, payload: str, target: str) -> Optional[str]:
         """Send actual HTTP request."""
         try:
-            url = f"{target.rstrip('/')}/{endpoint.lstrip('/')}"
+            url = self._resolve_endpoint(target, endpoint)
             params = {"test": payload, "q": payload}
-            resp = await self.client.get(url, params=params)
+            async with self.budget.request(url):
+                resp = await self.client.get(url, params=params)
             return resp.text
-        except Exception as e:
+        except httpx.HTTPError as e:
             self.logger.debug(f"Request failed: {str(e)}")
             return None
 
     def _check_response(self, response: str, patterns: list[str]) -> bool:
         """Check response for vulnerability patterns using native C++ engine when available."""
         from secagents.core.native import native_engine
+
         for pattern in patterns:
             if native_engine.match_signature(response, pattern):
                 return True

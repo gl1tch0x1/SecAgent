@@ -1,6 +1,7 @@
 """Planner agent for strategy generation and task planning."""
 
 import logging
+from typing import Any
 
 from secagents.agents.base import BaseAgent, AgentConfig, AgentOutput, AgentRole
 from secagents.prompts import PLANNER_PROMPT
@@ -244,7 +245,7 @@ class PlannerAgent(BaseAgent):
         resources = {}
         for phase in phases:
             phase_name = phase["phase"]
-            agent_actions = {}
+            agent_actions: dict[str, list[str]] = {}
 
             for task in phase["tasks"]:
                 agent = task["agent"]
@@ -266,7 +267,7 @@ class PlannerAgent(BaseAgent):
         Returns:
             Timeline with durations
         """
-        timeline = {
+        timeline: dict[str, Any] = {
             "phases": [],
             "total_duration_minutes": 0,
         }

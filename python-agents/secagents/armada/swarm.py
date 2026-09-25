@@ -6,10 +6,9 @@ import asyncio
 from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Awaitable
+from secagents.core.orchestrator import Orchestrator, Intent, ExecutionGraph
 
 logger = logging.getLogger(__name__)
-
-from secagents.core.orchestrator import Orchestrator, Intent, ExecutionGraph
 
 
 @dataclass
@@ -28,7 +27,7 @@ DEFAULT_SPECIALISTS = [
     AgentSpec("xss", "XSS Agent"),
     AgentSpec("ssrf", "SSRF Agent"),
     AgentSpec("idor", "IDOR Agent"),
-    AgentSpec("validator", "Validator Agent"),
+    AgentSpec("universal_scan", "Universal Scan Agent"),
 ]
 
 
@@ -71,17 +70,15 @@ class ArmadaOrchestrator:
         # Route tasks to appropriate specialist agents based on action semantics
         action_routing = {
             "full_recon": "subdomain",
-            "universal_scan": "web_crawl",
-            "validate": "validator",
-            "generate": "validator",
+            "universal_scan": "universal_scan",
         }
         for task in graph.tasks:
             routed = action_routing.get(task.action)
             if routed and routed in self._specialists:
                 task.agent = routed
             elif task.agent not in self._specialists:
-                # Fallback: use agent if registered, else use first available specialist
-                task.agent = task.agent if task.agent in self._specialists else next(iter(self._specialists), "port_scan")
+                # An unknown action must fail visibly, never run a different tool.
+                logger.warning("No specialist registered for action %s", task.action)
         return graph
 
     def hire_specialists(self, graph: ExecutionGraph) -> list[AgentSpec]:
@@ -93,7 +90,7 @@ class ArmadaOrchestrator:
         """Execute DAG with worker pool parallelism."""
         from secagents.core.orchestrator import TaskState
 
-        results: dict[str, Any] = {"tasks": {}, "findings": []}
+        results: dict[str, Any] = {"tasks": {}, "findings": [], "failures": []}
         sem = asyncio.Semaphore(self.workers)
 
         async def run_task(task_obj: Any) -> None:
@@ -105,13 +102,19 @@ class ArmadaOrchestrator:
                         out = await handler(context=context, action=task_obj.action)
                         task_obj.state = TaskState.DONE
                     else:
-                        out = {"status": "skipped", "agent": task_obj.agent, "reason": "no handler registered"}
+                        out = {
+                            "status": "skipped",
+                            "agent": task_obj.agent,
+                            "reason": "no handler registered",
+                        }
                         task_obj.state = TaskState.FAILED
                 except Exception as exc:
                     out = {"status": "failed", "agent": task_obj.agent, "error": str(exc)}
                     task_obj.state = TaskState.FAILED
 
                 results["tasks"][task_obj.id] = out
+                if task_obj.state == TaskState.FAILED:
+                    results["failures"].append({"action": task_obj.action, **out})
                 if isinstance(out, dict) and "findings" in out:
                     results["findings"].extend(out["findings"])
 
@@ -124,6 +127,13 @@ class ArmadaOrchestrator:
                 pending = [t for t in graph.tasks if t.state == TaskState.PENDING]
                 for t in pending:
                     t.state = TaskState.FAILED
+                    results["failures"].append(
+                        {
+                            "action": t.action,
+                            "status": "blocked",
+                            "reason": "dependency did not complete",
+                        }
+                    )
                 break
             await asyncio.gather(*[run_task(t) for t in ready])
             rounds += 1

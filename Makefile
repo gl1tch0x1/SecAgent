@@ -17,23 +17,22 @@ build-go:
 	cd go-services/cli && go build -o bin/secagents-cli ./cmd
 
 build-python:
-	cd python-agents && pip install -e .
+	cd python-agents && python -m pip install -e .
 
 # --- Test ---
 test: test-rust test-go test-cpp test-python
 
 test-cpp:
-	cd cpp-core/build && ctest --output-on-failure || true
+	ctest --test-dir cpp-core/build --output-on-failure
 
 test-rust:
 	cd rust-core && cargo test
 
 test-go:
-	cd go-services/recon && go test ./...
-	cd go-services/scanners && go test ./...
+	cd go-services && go test ./recon/... ./scanners/... ./cli/...
 
 test-python:
-	cd python-agents && pytest
+	cd python-agents && python -m pytest ../tests/unit/
 
 # --- Docker ---
 docker-up:
@@ -46,4 +45,3 @@ docker-down:
 clean:
 	cd rust-core && cargo clean
 	cd go-services/recon && go clean
-

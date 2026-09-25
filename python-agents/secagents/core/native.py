@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import os
 import re
 import sys
 from pathlib import Path
@@ -63,7 +62,9 @@ class NativeCore:
     def match_signature(self, buffer: str, pattern: str) -> bool:
         """High-speed signature scanning via native C++ matcher (fallback to Python re)."""
         if self._lib:
-            res = self._lib.secagent_match_signature(buffer.encode("utf-8"), pattern.encode("utf-8"))
+            res = self._lib.secagent_match_signature(
+                buffer.encode("utf-8"), pattern.encode("utf-8")
+            )
             return res == 1
 
         # Fallback pure-Python regex implementation
@@ -76,10 +77,17 @@ class NativeCore:
         """Probe socket port via native C++ prober (fallback to socket)."""
         if self._lib:
             res = self._lib.secagent_probe_port(host.encode("utf-8"), port, timeout_ms)
-            return {"open": bool(res.open), "port": res.port, "latency_ms": round(res.latency_ms, 2), "engine": "cpp-core"}
+            return {
+                "open": bool(res.open),
+                "port": res.port,
+                "latency_ms": round(res.latency_ms, 2),
+                "engine": "cpp-core",
+            }
 
         # Fallback pure-Python socket probe
-        import socket, time
+        import socket
+        import time
+
         start = time.time()
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout_ms / 1000.0)

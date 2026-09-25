@@ -34,7 +34,9 @@ class TeleoperationController:
         now = time.time()
         # Double Ctrl+C within 600ms triggers Teleoperation REPL
         if now - self.last_sigint_time < 0.6:
-            logger.warning("\n󱈸 Double Ctrl+C detected — Intercepting scan execution for Teleoperation REPL!")
+            logger.warning(
+                "\n󱈸 Double Ctrl+C detected — Intercepting scan execution for Teleoperation REPL!"
+            )
             self.is_paused = True
             if self.pause_callback:
                 self.pause_callback()
@@ -75,7 +77,9 @@ class TeleoperationController:
                     instruction = parts[1] if len(parts) > 1 else ""
                     print(f"  [+] Injected instruction: '{instruction}'")
                 else:
-                    print("  [?] Unknown action. Available: inspect, inject <msg>, step, resume, abort")
+                    print(
+                        "  [?] Unknown action. Available: inspect, inject <msg>, step, resume, abort"
+                    )
             except (KeyboardInterrupt, EOFError):
                 print("\n  [-] Resuming...")
                 self.is_paused = False

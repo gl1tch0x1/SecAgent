@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +31,8 @@ from rich.theme import Theme
 from rich.box import ROUNDED, DOUBLE_EDGE
 
 from secagents import __version__
+from secagents.config import load_runtime_config
+from secagents.infra.telemetry import MetricsCollector, configure_logging
 from secagents.operational.integrity import check_and_apply_tool_update
 from secagents.vault.env_loader import Vault
 from secagents.pipeline.runner import ScanPipeline
@@ -58,22 +62,28 @@ console = Console(theme=custom_theme)
 
 # ─── ASCII ARSENAL ───────────────────────────────────────────────────────────
 BANNER = r"""
-    _____           ___                    __
-   / ___/___  _____/   | ____ ____  ____  / /______
-   \__ \/ _ \/ ___/ /| |/ __ `/ _ \/ __ \/ __/ ___/
-  ___/ /  __/ /__/ ___ / /_/ /  __/ / / / /_(__  )
- /____/\___/\___/_/  |_\__, /\___/_/ /_/_/   \___/
-                      /____/
+   ____             __  ___   ____                 
+  / __ \___  ___   / / / _ | / __/___  ____  ____ 
+ / / / / _ \/ _ \ / / / __ |/ /_/ __ \/ __ \/ __ \
+/ /_/ /  __/  __// / / /_/ / __/ /_/ / / / / /_/ /
+\____/ \___|\___/_/  \____/_/  \____/_/_/ /_/ .___/
+                                          /_/     
 """
 
 
 def print_banner():
     banner_text = Text(BANNER, style="hacker")
     subtext = Text.from_markup(
-        f"\n[bold white]» AUTONOMOUS OFFENSIVE INTELLIGENCE FRAMEWORK «[/]\n[dim]VERSION {__version__} | RED TEAM OPERATIONS[/]\n"
+        f"\n[bold white]SECAGENT[/]\n[dim]Version {__version__} | authorized security assessment workflow[/]\n"
     )
     console.print(
-        Panel(Group(banner_text, subtext), border_style="#00ff00", box=DOUBLE_EDGE, expand=False, padding=(1, 2))
+        Panel(
+            Group(banner_text, subtext),
+            border_style="#66ffcc",
+            box=DOUBLE_EDGE,
+            expand=False,
+            padding=(1, 2),
+        )
     )
 
 
@@ -96,6 +106,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version", version=f"SecAgent {__version__}")
+    p.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+        help="Set the runtime logging verbosity for the CLI",
+    )
+    p.add_argument(
+        "--json-output",
+        action="store_true",
+        help="Emit structured JSON logs instead of plain text output",
+    )
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -112,7 +133,38 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument(
         "--skip-os-check", action="store_true", help="Bypass OS security baseline check"
     )
-    scan.add_argument("--no-sandbox", action="store_true", help="Bypass Docker Fortress isolation")
+    scan.add_argument("--no-sandbox", action="store_true", help=argparse.SUPPRESS)
+    scan.add_argument(
+        "--max-requests", type=int, default=1000, help="Maximum built-in HTTP requests"
+    )
+    scan.add_argument("--rate-limit", type=float, default=5.0, help="Requests per second per host")
+    scan.add_argument("--max-duration", type=float, default=900.0, help="Scan deadline in seconds")
+    scan.add_argument(
+        "--header-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Environment variable containing one HTTP session header (Name: value)",
+    )
+    scan.add_argument(
+        "--cookie-env",
+        metavar="NAME",
+        help="Environment variable containing the Cookie header value",
+    )
+    scan.add_argument("--api-spec", help="Local OpenAPI/Swagger JSON or YAML file")
+    scan.add_argument("--har", action="append", default=[], help="Local HAR capture file")
+    scan.add_argument(
+        "--identity-contract",
+        help="JSON file of read-only, two-identity proof cases; credentials come from environment variables",
+    )
+    scan.add_argument(
+        "--state-contract",
+        help="JSON file of opt-in state read, negative control, write and cleanup cases",
+    )
+    scan.add_argument(
+        "--ssrf-contract",
+        help="JSON file of GET SSRF probes using an approved operator-controlled OAST service",
+    )
     scan.add_argument("--no-arsenal", action="store_true", help="Skip heuristic Arsenal probes")
     scan.add_argument("--insecure", action="store_true", help="Bypass SSL/TLS verification")
     scan.add_argument(
@@ -145,14 +197,21 @@ def build_parser() -> argparse.ArgumentParser:
     # Cognitive Memory Command
     memory = sub.add_parser("memory", help="Inspect and query Aura Cognitive Memory")
     memory.add_argument("--target", "-t", help="Filter memory by target domain")
-    memory.add_argument("--purge-decay", action="store_true", help="Apply memory decay and purge stale patterns")
+    memory.add_argument(
+        "--purge-decay", action="store_true", help="Apply memory decay and purge stale patterns"
+    )
 
     # 12 Specialized Agents Command
     sub.add_parser("agents", help="List 12 specialized AI swarm agents")
 
     # CTF Solver Workflow Command
     ctf_cmd = sub.add_parser("ctf", help="Execute CTF challenge solver pipeline")
-    ctf_cmd.add_argument("--category", choices=["web", "pwn", "crypto", "forensics"], default="web", help="CTF challenge category")
+    ctf_cmd.add_argument(
+        "--category",
+        choices=["web", "pwn", "crypto", "forensics"],
+        default="web",
+        help="CTF challenge category",
+    )
     ctf_cmd.add_argument("--input", required=True, help="Target URL, binary, or challenge input")
 
     # MCP Server Command
@@ -171,6 +230,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def cmd_scan(args: argparse.Namespace) -> int:
+    try:
+        config = load_runtime_config(args)
+    except ValueError as exc:
+        console.print(f"[error]Configuration error:[/error] {exc}")
+        return 2
+
+    args.workers = max(1, config.scan.workers)
+    args.max_requests = max(1, config.scan.max_requests)
+    args.rate_limit = max(0.1, config.scan.requests_per_second_per_host)
+    args.max_duration = max(1.0, config.scan.max_duration_seconds)
     if args.insecure:
         os.environ["SECAGENT_VERIFY_SSL"] = "false"
 
@@ -178,6 +247,29 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         domain = enforce_scope(args.target)
     except ScopeViolationError as e:
         console.print(f"[error]⛔ Scope Violation:[/error] {e}")
+        return 2
+
+    try:
+        auth_headers: dict[str, str] = {}
+        for name in args.header_env:
+            raw = os.environ.get(name)
+            if raw is None:
+                raise ValueError(f"Session header variable {name} is not set")
+            header_name, separator, header_value = raw.partition(":")
+            if not separator or not re.fullmatch(r"[A-Za-z0-9-]+", header_name):
+                raise ValueError(f"Session header variable {name} is malformed")
+            if header_name.lower() in {"host", "content-length", "transfer-encoding", "connection"}:
+                raise ValueError(f"Session header variable {name} uses a restricted header")
+            if any(c in header_value for c in "\r\n"):
+                raise ValueError(f"Session header variable {name} contains a line break")
+            auth_headers[header_name] = header_value.strip()
+        if args.cookie_env:
+            cookie = os.environ.get(args.cookie_env)
+            if cookie is None or any(c in cookie for c in "\r\n"):
+                raise ValueError("Cookie environment variable is unset or invalid")
+            auth_headers["Cookie"] = cookie
+    except ValueError as exc:
+        console.print(f"[error]Session configuration error:[/error] {exc}")
         return 2
 
     console.print(
@@ -189,11 +281,20 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         target=args.target,
         depth=args.depth,
         workers=args.workers,
-        use_sandbox=not args.no_sandbox,
+        use_sandbox=False,
         skip_os_check=args.skip_os_check,
         setup_local_llm=args.setup_local_llm,
         results_dir=Path(args.results_dir),
         arsenal_secondary=not args.no_arsenal,
+        max_requests=args.max_requests,
+        requests_per_second_per_host=args.rate_limit,
+        max_duration_seconds=args.max_duration,
+        auth_headers=auth_headers,
+        api_spec_path=Path(args.api_spec) if args.api_spec else None,
+        har_paths=[Path(path) for path in args.har],
+        identity_contract_path=Path(args.identity_contract) if args.identity_contract else None,
+        state_contract_path=Path(args.state_contract) if args.state_contract else None,
+        ssrf_contract_path=Path(args.ssrf_contract) if args.ssrf_contract else None,
     )
 
     try:
@@ -252,10 +353,20 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             )
     else:
         console.print(
-            Panel(
-                "[success]✓ No vulnerabilities detected in target scope.[/success]",
-                border_style="success",
-            )
+            "[warning]No validated findings. This does not establish that the target is vulnerability-free.[/warning]"
+        )
+
+    if results.get("manual_leads"):
+        console.print(
+            f"[warning]{len(results['manual_leads'])} candidate(s) require manual or additional proof.[/warning]"
+        )
+    if results.get("phases", {}).get("armada_failures"):
+        console.print(
+            f"[error]{len(results['phases']['armada_failures'])} scan task(s) failed; coverage is incomplete.[/error]"
+        )
+    if results.get("budget", {}).get("termination_reason"):
+        console.print(
+            f"[error]Scan budget ended the run: {results['budget']['termination_reason']}; coverage is incomplete.[/error]"
         )
 
     console.print(
@@ -272,7 +383,14 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             Panel(r_table, title="[bold white]DELIVERABLES[/bold white]", border_style="cyan")
         )
 
-    return 0
+    return (
+        2
+        if (
+            results.get("phases", {}).get("armada_failures")
+            or results.get("budget", {}).get("termination_reason")
+        )
+        else 0
+    )
 
 
 async def cmd_vault(args: argparse.Namespace) -> int:
@@ -377,9 +495,23 @@ async def cmd_keyhacks(args: argparse.Namespace) -> int:
 
 def main() -> None:
     _load_env()
-    print_banner()
     parser = build_parser()
     args = parser.parse_args()
+
+    try:
+        runtime = load_runtime_config(args)
+    except ValueError as exc:
+        parser.exit(2, f"Configuration error: {exc}\n")
+
+    logger = configure_logging(runtime.log_level, runtime.json_output)
+    metrics = MetricsCollector()
+    metrics.increment("cli_invocations")
+    logger.info(
+        "secagent startup",
+        extra={"event": "cli.start", "target": runtime.target, "log_level": runtime.log_level},
+    )
+
+    print_banner()
 
     try:
         if args.command == "scan":
@@ -422,6 +554,7 @@ def main() -> None:
             )
         elif args.command == "tools":
             from secagents.arsenal.registry import ToolRegistry
+
             table = Table(title="150+ SECURITY TOOLS ARSENAL CATALOG", box=ROUNDED, expand=True)
             table.add_column("KEY", style="bold cyan")
             table.add_column("TOOL NAME", style="bold white")
@@ -438,11 +571,14 @@ def main() -> None:
             console.print(table)
         elif args.command == "memory":
             from secagents.core.aura_memory import AuraMemoryManager
+
             mem = AuraMemoryManager.get_instance()
 
             if args.purge_decay:
                 purged = mem.apply_decay()
-                console.print(f"[success]✓ Memory decay applied: purged {purged} stale patterns.[/success]")
+                console.print(
+                    f"[success]✓ Memory decay applied: purged {purged} stale patterns.[/success]"
+                )
 
             info = mem.inspect_memory(target=args.target)
             console.print(
@@ -472,16 +608,33 @@ def main() -> None:
                 console.print(p_table)
         elif args.command == "agents":
             from secagents.agents.specialized import (
-                IntelligentDecisionEngine, BugBountyWorkflowManager, CTFWorkflowManager,
-                CVEIntelligenceManager, AIExploitGenerator, VulnerabilityCorrelator,
-                TechnologyDetector, RateLimitDetector, FailureRecoverySystem,
-                PerformanceMonitor, ParameterOptimizer, GracefulDegradation
+                IntelligentDecisionEngine,
+                BugBountyWorkflowManager,
+                CTFWorkflowManager,
+                CVEIntelligenceManager,
+                AIExploitGenerator,
+                VulnerabilityCorrelator,
+                TechnologyDetector,
+                RateLimitDetector,
+                FailureRecoverySystem,
+                PerformanceMonitor,
+                ParameterOptimizer,
+                GracefulDegradation,
             )
+
             agents_list = [
-                IntelligentDecisionEngine(), BugBountyWorkflowManager(), CTFWorkflowManager(),
-                CVEIntelligenceManager(), AIExploitGenerator(), VulnerabilityCorrelator(),
-                TechnologyDetector(), RateLimitDetector(), FailureRecoverySystem(),
-                PerformanceMonitor(), ParameterOptimizer(), GracefulDegradation()
+                IntelligentDecisionEngine(),
+                BugBountyWorkflowManager(),
+                CTFWorkflowManager(),
+                CVEIntelligenceManager(),
+                AIExploitGenerator(),
+                VulnerabilityCorrelator(),
+                TechnologyDetector(),
+                RateLimitDetector(),
+                FailureRecoverySystem(),
+                PerformanceMonitor(),
+                ParameterOptimizer(),
+                GracefulDegradation(),
             ]
             table = Table(title="12 SPECIALIZED AI SWARM AGENTS", box=ROUNDED, expand=True)
             table.add_column("AGENT NAME", style="bold cyan")
@@ -493,26 +646,42 @@ def main() -> None:
             console.print(table)
         elif args.command == "ctf":
             from secagents.agents.specialized import CTFWorkflowManager
+
             agent = CTFWorkflowManager()
             out = asyncio.run(agent.execute({"category": args.category, "input": args.input}))
-            console.print(Panel(f"CTF Solver Output:\n{out.result}", title=f"CTF SOLVER — {args.category.upper()}", border_style="green"))
+            console.print(
+                Panel(
+                    f"CTF Solver Output:\n{out.result}",
+                    title=f"CTF SOLVER — {args.category.upper()}",
+                    border_style="green",
+                )
+            )
         elif args.command == "mcp":
             from secagents.mcp_server import MCPServer
+
             server = MCPServer()
             server.run_stdio()
         elif args.command == "playbook":
             from secagents.operational.playbook import Playbook, PlaybookRunner
+
             pb = Playbook.from_yaml_file(Path(args.file))
             runner = PlaybookRunner(pb)
             success = runner.run(args.target)
-            msg = "[success]✓ Playbook execution complete.[/success]" if success else "[error]❌ Playbook execution incomplete.[/error]"
+            msg = (
+                "[success]✓ Playbook execution complete.[/success]"
+                if success
+                else "[error]❌ Playbook execution incomplete.[/error]"
+            )
             console.print(Panel(msg, title=f"PLAYBOOK — {pb.name.upper()}", border_style="cyan"))
         elif args.command == "replay":
             from secagents.operational.proof_capsule import ProofCapsuleReplayer
+
             replayer = ProofCapsuleReplayer()
             ok, msg = replayer.replay_file(Path(args.capsule))
             border = "green" if ok else "yellow"
-            console.print(Panel(msg, title="PROOF CAPSULE REPLAY VERIFICATION", border_style=border))
+            console.print(
+                Panel(msg, title="PROOF CAPSULE REPLAY VERIFICATION", border_style=border)
+            )
     except KeyboardInterrupt:
         console.print("\n[warning]⚠ Mission aborted by operator.[/warning]")
         sys.exit(130)

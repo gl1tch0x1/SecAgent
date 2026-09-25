@@ -50,6 +50,7 @@ class Playbook:
     def from_yaml_file(cls, filepath: Path) -> Playbook:
         try:
             import yaml
+
             content = yaml.safe_load(filepath.read_text(encoding="utf-8"))
             return cls.from_dict(content)
         except ImportError:
@@ -75,7 +76,9 @@ class PlaybookRunner:
         for phase in self.playbook.phases:
             # Check dependencies
             if any(dep not in self.completed_phases for dep in phase.depends_on):
-                logger.warning(f"Phase '{phase.id}' skipped: dependencies not satisfied ({phase.depends_on})")
+                logger.warning(
+                    f"Phase '{phase.id}' skipped: dependencies not satisfied ({phase.depends_on})"
+                )
                 continue
 
             logger.info(f"Running phase '{phase.id}' with tools {phase.tools}")

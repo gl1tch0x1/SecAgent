@@ -17,7 +17,7 @@ class CINotifier:
     async def notify_slack(self, findings: list[dict], report_path: str) -> bool:
         if not self.slack_webhook:
             return False
-        severity_counts = {}
+        severity_counts: dict[str, int] = {}
         for f in findings:
             sev = f.get("severity", "info")
             severity_counts[sev] = severity_counts.get(sev, 0) + 1

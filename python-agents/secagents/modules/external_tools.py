@@ -1,11 +1,13 @@
-"""External security tool integrations via async subprocess."""
+"""Bounded, shell-free wrappers for optional security tools."""
 
 from __future__ import annotations
 
 import asyncio
-import shlex
 import shutil
 from dataclasses import dataclass
+
+from secagents.infra.scope import enforce_scope
+from secagents.infra.execution_budget import ExecutionBudget
 
 
 @dataclass
@@ -17,19 +19,19 @@ class ToolResult:
 
 
 class ExternalTools:
-    """Async wrappers for common security tools."""
+    """Invoke known binaries without passing a target through a shell."""
 
     TOOLS = {
-        "subfinder": "subfinder -d {target} -silent",
-        "httpx": "httpx -u {target} -silent -status-code -tech-detect",
-        "naabu": "naabu -host {target} -top-ports 100 -silent -json",
-        "katana": "katana -u {target} -silent -jc -d 3",
-        "waybackurls": "echo {target} | waybackurls",
-        "nuclei": "nuclei -u {target} -severity medium,high,critical -json",
-        "arjun": "arjun -u {target} --stable -oJ /dev/stdout",
-        "ffuf": "ffuf -u {target}/FUZZ -w {wordlist} -mc 200,301,302 -s",
-        "ghauri": "ghauri -u {target} --batch --level 2",
-        "nomore403": "nomore403 -u {target}",
+        "subfinder",
+        "httpx",
+        "naabu",
+        "katana",
+        "waybackurls",
+        "nuclei",
+        "arjun",
+        "ffuf",
+        "ghauri",
+        "nomore403",
     }
 
     @staticmethod
@@ -37,47 +39,91 @@ class ExternalTools:
         return {name: shutil.which(name) is not None for name in ExternalTools.TOOLS}
 
     @staticmethod
-    async def run(tool: str, target: str, timeout: int = 120, **kwargs) -> ToolResult:
-        template = ExternalTools.TOOLS.get(tool)
-        if not template:
-            return ToolResult(tool=tool, success=False, output=[], raw=f"Unknown tool: {tool}")
-        if not shutil.which(tool):
-            return ToolResult(tool=tool, success=False, output=[], raw=f"{tool} not installed")
-
-        safe_target = shlex.quote(target)
-        safe_kwargs = {k: shlex.quote(str(v)) for k, v in kwargs.items()}
+    async def run(
+        tool: str,
+        target: str,
+        timeout: int = 120,
+        budget: ExecutionBudget | None = None,
+        **kwargs,
+    ) -> ToolResult:
+        if tool not in ExternalTools.TOOLS:
+            return ToolResult(tool, False, [], f"Unknown tool: {tool}")
+        binary = shutil.which(tool)
+        if not binary:
+            return ToolResult(tool, False, [], f"{tool} not installed")
         try:
-            cmd = template.format(target=safe_target, **safe_kwargs)
-        except KeyError as e:
-            return ToolResult(tool=tool, success=False, output=[], raw=f"Missing parameter: {e}")
+            enforce_scope(target)
+        except PermissionError as exc:
+            return ToolResult(tool, False, [], f"Scope violation: {exc}")
+        if budget is not None:
+            return ToolResult(
+                tool,
+                False,
+                [],
+                "Skipped: external tool HTTP traffic cannot be counted or scope-checked by the shared budget",
+            )
+
+        args: dict[str, list[str]] = {
+            "subfinder": ["-d", target, "-silent"],
+            "httpx": ["-u", target, "-silent", "-status-code", "-tech-detect"],
+            "naabu": ["-host", target, "-top-ports", "100", "-silent", "-json"],
+            "katana": ["-u", target, "-silent", "-jc", "-d", "3"],
+            "waybackurls": [],
+            "nuclei": ["-u", target, "-severity", "medium,high,critical", "-json"],
+            "arjun": ["-u", target, "--stable", "-oJ", "-"],
+            "ghauri": ["-u", target, "--batch", "--level", "2"],
+            "nomore403": ["-u", target],
+        }
+        if tool == "ffuf":
+            wordlist = kwargs.get("wordlist")
+            if not wordlist:
+                return ToolResult(tool, False, [], "wordlist is required")
+            args[tool] = [
+                "-u",
+                target.rstrip("/") + "/FUZZ",
+                "-w",
+                str(wordlist),
+                "-mc",
+                "200,301,302",
+                "-s",
+            ]
 
         try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
+            proc = await asyncio.create_subprocess_exec(
+                binary,
+                *args[tool],
+                stdin=asyncio.subprocess.PIPE if tool == "waybackurls" else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            lines = [line for line in stdout.decode().strip().split("\n") if line]
+            stdin = (target + "\n").encode() if tool == "waybackurls" else None
+            stdout, stderr = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
+            output = stdout.decode(errors="replace")
+            error = stderr.decode(errors="replace")
             return ToolResult(
-                tool=tool, success=proc.returncode == 0, output=lines, raw=stdout.decode()
+                tool,
+                proc.returncode == 0,
+                [line for line in output.splitlines() if line],
+                output if proc.returncode == 0 else error[:1000],
             )
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return ToolResult(tool=tool, success=False, output=[], raw="Timeout")
-        except Exception as e:
-            return ToolResult(tool=tool, success=False, output=[], raw=str(e))
+            return ToolResult(tool, False, [], "Timeout")
+        except OSError as exc:
+            return ToolResult(tool, False, [], str(exc))
 
     @staticmethod
-    async def run_parallel(tools: list[str], target: str) -> dict[str, ToolResult]:
-        tasks = {t: ExternalTools.run(t, target) for t in tools}
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    async def run_parallel(
+        tools: list[str], target: str, budget: ExecutionBudget | None = None
+    ) -> dict[str, ToolResult]:
+        results = await asyncio.gather(
+            *(ExternalTools.run(tool, target, budget=budget) for tool in tools),
+            return_exceptions=True,
+        )
         return {
-            name: (
-                r
-                if isinstance(r, ToolResult)
-                else ToolResult(tool=name, success=False, output=[], raw=str(r))
-            )
-            for name, r in zip(tasks.keys(), results)
+            name: result
+            if isinstance(result, ToolResult)
+            else ToolResult(name, False, [], str(result))
+            for name, result in zip(tools, results)
         }

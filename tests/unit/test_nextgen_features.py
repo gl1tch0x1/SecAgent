@@ -37,8 +37,39 @@ def test_proof_capsule_serialization(tmp_path: Path):
     assert loaded.proof_signal == "SQL syntax error"
 
 
+def test_proof_capsule_serialization_redacts_session_credentials():
+    capsule = ProofCapsule(
+        id="cap-auth",
+        target_url="https://example.com/search?token=private-query",
+        vuln_type="sqli",
+        title="Private fixture",
+        severity="high",
+        http_method="GET",
+        request_headers={"Authorization": "Bearer private-header", "Accept": "text/html"},
+        request_body=None,
+        query_params={"session": "private-session"},
+        proof_signal="SQL syntax error",
+        timestamp=time.time(),
+        metadata={"request_header_env": {"Authorization": "SECAGENT_TEST_TOKEN"}},
+    )
+    serialized = capsule.to_json()
+    assert "private-header" not in serialized
+    assert "private-query" not in serialized
+    assert "private-session" not in serialized
+    loaded = ProofCapsule.from_json(serialized)
+    assert loaded.request_headers["Authorization"] == "[REDACTED]"
+    assert loaded.request_headers["Accept"] == "text/html"
+
+
 @pytest.mark.asyncio
-async def test_proof_capsule_replay_async():
+async def test_proof_capsule_replay_async(monkeypatch):
+    import httpx
+    from secagents.operational import proof_capsule
+
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="OK"))
+    monkeypatch.setattr(proof_capsule.httpx, "AsyncClient", lambda **kwargs: original_client(transport=transport))
     capsule = ProofCapsule(
         id="cap-test",
         target_url="https://example.com",
@@ -51,7 +82,7 @@ async def test_proof_capsule_replay_async():
         query_params={},
         proof_signal="Example Domain",
         timestamp=time.time(),
-        metadata={},
+        metadata={"check_key": "missing_headers"},
     )
     replayer = ProofCapsuleReplayer(timeout_seconds=5.0)
     ok, msg = await replayer.replay_async(capsule)

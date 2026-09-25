@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -167,45 +168,106 @@ class Orchestrator:
                     await handler(data)
                 else:
                     handler(data)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger = __import__("logging").getLogger(__name__)
+                logger.warning(
+                    "Event handler for '%s' failed while processing task %s: %s",
+                    event_type,
+                    data.get("task_id", "unknown"),
+                    exc,
+                )
 
     def classify_intent(self, request: str) -> Intent:
         """
         Fast intent classification without LLM call.
 
-        Args:
-            request: User request string to classify.
-
-        Returns:
-            Classified Intent enum value.
+        This version normalizes the request and matches a prioritized set of
+        domain-specific expressions so natural user phrasing is classified more
+        reliably than a brittle raw substring check.
         """
-        r = request.lower()
-        if any(
-            w in r
-            for w in [
+        if not request or not str(request).strip():
+            return Intent.QUERY
+
+        r = str(request).lower()
+        normalized = re.sub(r"[^a-z0-9\s-]", " ", r)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        keyword_rules = [
+            (Intent.AI_SAFETY, [
                 "ai safety",
+                "prompt injection",
                 "repo poisoning",
                 "assistant config",
                 "cursorrules",
-                "prompt injection",
-            ]
-        ):
-            return Intent.AI_SAFETY
-        if any(w in r for w in ["bug bounty", "bounty hunter", "h1", "bugcrowd"]):
-            return Intent.SCAN  # Map to scan for now, but with bug bounty context
-        if any(w in r for w in ["web assessment", "pentest", "security audit"]):
+                "llm jailbreak",
+                "rag poisoning",
+                "agent compromise",
+            ]),
+            (Intent.SCAN, [
+                "bug bounty",
+                "bounty hunter",
+                "security audit",
+                "web assessment",
+                "pentest",
+                "vulnerability scan",
+                "web security",
+                "scan for vulnerabilities",
+                "check for xss",
+                "check for sqli",
+                "sql injection",
+                "xss",
+                "ssrf",
+            ]),
+            (Intent.RECON, [
+                "reconnaissance",
+                "recon",
+                "discover assets",
+                "subdomain enumeration",
+                "discover subdomains",
+                "asset discovery",
+                "enumerate hosts",
+                "enumerate endpoints",
+                "find open ports",
+                "crawl website",
+            ]),
+            (Intent.REPORT, [
+                "report",
+                "generate a report",
+                "write a summary",
+                "executive summary",
+                "final report",
+                "export findings",
+                "deliverable",
+            ]),
+            (Intent.VALIDATE, [
+                "validate",
+                "verify",
+                "confirm",
+                "poc",
+                "proof",
+                "replay",
+                "check exploitability",
+            ]),
+            (Intent.PLAN, [
+                "plan",
+                "strategy",
+                "decompose",
+                "roadmap",
+                "execution plan",
+            ]),
+        ]
+
+        for intent, phrases in keyword_rules:
+            if any(phrase in normalized for phrase in phrases):
+                return intent
+
+        if any(word in normalized for word in ["scan", "test", "exploit", "attack", "vuln", "issue", "find"]):
             return Intent.SCAN
-        if any(w in r for w in ["plan", "decompose", "strategy"]):
-            return Intent.PLAN
-        if any(w in r for w in ["report", "generate", "export", "summary"]):
-            return Intent.REPORT
-        if any(w in r for w in ["validate", "confirm", "verify", "poc"]):
-            return Intent.VALIDATE
-        if any(w in r for w in ["recon", "discover", "subdomain", "enumerate"]):
+        if any(word in normalized for word in ["discover", "subdomain", "enumerate", "crawl", "recon"]):
             return Intent.RECON
-        if any(w in r for w in ["scan", "test", "exploit", "attack", "vuln", "issue", "find"]):
-            return Intent.SCAN
+        if any(word in normalized for word in ["report", "summary", "deliverable", "export"]):
+            return Intent.REPORT
+
         return Intent.QUERY
 
     def decompose_intent(self, intent: Intent, context: dict) -> ExecutionGraph:
@@ -247,29 +309,9 @@ class Orchestrator:
                 tools=["universal_analyzer"],
                 memory_scope="runtime",
             )
-            # Phase 3: Validation (depends on scan)
-            validate = Task(
-                intent=Intent.VALIDATE,
-                agent="validator",
-                action="validate",
-                input={},
-                depends_on=[scan.id],
-                model_hint="reasoning",
-                tools=["http_request", "poc_generate"],
-                memory_scope="runtime",
-            )
-            # Phase 4: Report generation (depends on validation)
-            report = Task(
-                intent=Intent.REPORT,
-                agent="report",
-                action="generate",
-                input={},
-                depends_on=[validate.id],
-                model_hint="fast",
-                tools=["report_generate"],
-                memory_scope="persistent",
-            )
-            graph.tasks = [recon, scan, validate, report]
+            # The scan pipeline owns proof validation and reporting. Running those
+            # stages here duplicated validation and could publish intermediate data.
+            graph.tasks = [recon, scan]
 
         elif intent == Intent.AI_SAFETY:
             graph.tasks = [
@@ -373,6 +415,7 @@ class Orchestrator:
 
         executor = self._agents.get(agent_name)
         if not executor:
+
             def default_executor(action, input_data):
                 return {"status": "completed", "action": action, "agent": agent_name}
 
@@ -394,8 +437,8 @@ class Orchestrator:
         Returns:
             Dictionary with aggregated results keyed by agent names.
         """
-        aggregated = {}
-        errors = []
+        aggregated: dict[str, Any] = {}
+        errors: list[dict] = []
 
         for task in graph.tasks:
             if task.state == TaskState.DONE and task.output:
@@ -676,7 +719,11 @@ class Orchestrator:
         }
 
     async def execute_workflow(
-        self, intent: Intent | str, target: str = "", scope: str = "", context: Optional[dict] = None
+        self,
+        intent: Intent | str,
+        target: str = "",
+        scope: str = "",
+        context: Optional[dict] = None,
     ) -> dict:
         """Execute workflow for a specified intent and target context."""
         ctx = context or {}

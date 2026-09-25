@@ -113,7 +113,7 @@ class DualMemory:
 
     async def get_context_for_agent(self, agent: str, scope: str = "") -> dict:
         """Get only relevant memory for a specific agent. Never full dump."""
-        context = {}
+        context: dict[str, Any] = {}
         if scope == "persistent":
             relevant = self.memory_query(agent)
             if relevant:
@@ -150,4 +150,3 @@ class PersistentMemory:
 
     def retrieve(self, key: str) -> Any:
         return self._store.get(key)
-

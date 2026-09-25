@@ -9,6 +9,8 @@ from secagents.modules.exploit_chain import correlate_chains
 from secagents.engine.auto_healer import AutoHealer
 from secagents.engine.telemetry import TelemetryCollector
 from secagents.infra.logging_system import AuditLogger, AuditCategory
+from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.infra.execution_budget import ExecutionBudget
 
 
 class Autopilot:
@@ -17,6 +19,7 @@ class Autopilot:
     def __init__(self, target: str, config: dict | None = None):
         self.target = target
         self.config = config or {}
+        self.budget: ExecutionBudget | None = self.config.get("budget")
         self._healer = AutoHealer()
         self._telemetry = TelemetryCollector()
         self._logger = AuditLogger.get_instance()
@@ -41,7 +44,7 @@ class Autopilot:
     async def _phase_recon(self) -> None:
         self._telemetry.record_action("autopilot", "recon_start")
         recon_tools = ["subfinder", "httpx", "katana", "waybackurls"]
-        results = await ExternalTools.run_parallel(recon_tools, self.target)
+        results = await ExternalTools.run_parallel(recon_tools, self.target, self.budget)
         self.results["phases"]["recon"] = {
             t: {"success": r.success, "count": len(r.output)} for t, r in results.items()
         }
@@ -50,13 +53,21 @@ class Autopilot:
         for r in results.values():
             for line in r.output:
                 if line.startswith("http"):
-                    endpoints.add(line)
+                    try:
+                        enforce_scope(line)
+                        endpoints.add(line)
+                    except ScopeViolationError:
+                        continue
         self.results["endpoints"] = list(endpoints)[:500]
 
     async def _phase_scan(self) -> None:
         self._telemetry.record_action("autopilot", "scan_start")
         scan_tools = ["nuclei", "naabu"]
-        results = await ExternalTools.run_parallel(scan_tools, self.target)
+        results = await ExternalTools.run_parallel(scan_tools, self.target, self.budget)
+        self.results["phases"]["scan"] = {
+            tool: {"success": result.success, "error": "" if result.success else result.raw[:200]}
+            for tool, result in results.items()
+        }
         for tool, result in results.items():
             for line in result.output:
                 try:
