@@ -127,6 +127,16 @@ def build_scan_handlers(
         }
 
     async def specialized_vuln_handler(vuln_type: str, context: dict) -> dict:
+        if vuln_type in {"ssrf", "idor"}:
+            return {
+                "findings": [],
+                "vuln_type": vuln_type,
+                "coverage_gap": (
+                    "SSRF requires an operator-controlled callback proof contract"
+                    if vuln_type == "ssrf"
+                    else "IDOR requires separate authorized identities and a control resource"
+                ),
+            }
         target = shared["target"]
         endpoints = shared.get("endpoints", [f"https://{target}"])
 
@@ -142,7 +152,10 @@ def build_scan_handlers(
         if not scoped_endpoints:
             scoped_endpoints = [f"https://{target}"]
 
-        agent = WebSecurityAgent()
+        agent = WebSecurityAgent(
+            budget=shared.get("budget"),
+            auth_headers=shared.get("auth_headers"),
+        )
         out = await agent.execute(
             {
                 "target": f"https://{target}",
@@ -152,7 +165,11 @@ def build_scan_handlers(
         )
         findings = out.result.get("findings", []) if isinstance(out.result, dict) else []
         shared.setdefault("raw_findings", []).extend(findings)
-        return {"findings": findings, "vuln_type": vuln_type}
+        return {
+            "findings": findings,
+            "vuln_type": vuln_type,
+            "budget": out.result.get("budget") if isinstance(out.result, dict) else None,
+        }
 
     async def sqli_handler(*, context: dict, action: str, **_) -> dict:
         return await specialized_vuln_handler("sqli", context)

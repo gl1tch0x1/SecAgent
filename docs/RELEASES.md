@@ -171,12 +171,36 @@ git push origin main v0.3.0
 
 ---
 
+## Signed Releases & Verification
+
+Release artifacts are signed with a GPG key when the repository secret `RELEASE_GPG_PRIVATE_KEY` is configured. The workflow automatically imports the key, signs every binary and checksum file, and uploads the `.asc` signatures alongside the release assets.
+
+### Verify a signed artifact
+
+```bash
+# Download the binary and signature
+curl -L -O https://github.com/your-org/secagents/releases/download/v1.0.0/secagent-linux-x64
+curl -L -O https://github.com/your-org/secagents/releases/download/v1.0.0/secagent-linux-x64.asc
+
+# Verify the signature
+gpg --verify secagent-linux-x64.asc secagent-linux-x64
+
+# Verify the SHA256 manifest
+curl -L -O https://github.com/your-org/secagents/releases/download/v1.0.0/SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt
+```
+
+If the signature or checksum fails, do not ship or trust the artifact and treat the release as suspect until the issue is resolved.
+
+---
+
 ## Monitoring Releases
 
 ### GitHub UI
 - **Releases page** → Shows all published releases
 - **Release assets** → Click to download binaries
 - **SHA256SUMS.txt** → Verify binary integrity
+- ***.asc** → Detached GPG signatures for artifact authenticity
 
 ### Verify Release Integrity
 
@@ -198,17 +222,22 @@ sha256sum -c SHA256SUMS.txt
 If a release has critical issues:
 
 ```bash
-# 1. Delete the release (on GitHub UI)
+# 1. Delete the release on GitHub
 # 2. Delete the tag
-git push origin :refs/tags/v0.2.0
+git push origin :refs/tags/v1.0.0
 
-# 3. Fix the issue
-git fix
-
-# 4. Create new patch release
-git tag -a v0.2.1 -m "Hotfix"
-git push origin v0.2.1
+# 3. Fix the issue and create a patch version
+git checkout main
+git pull --ff-only
+git tag -a v1.0.1 -m "Hotfix: rollback and recovery for v1.0.0"
+git push origin v1.0.1
 ```
+
+Recommended recovery path:
+1. Freeze rollout and notify operators.
+2. Revert or disable the broken release in your package manager or deployment pipeline.
+3. Redeploy the last known-good version from the prior release tag.
+4. Publish a clear patch release with the fix and changelog note.
 
 ---
 

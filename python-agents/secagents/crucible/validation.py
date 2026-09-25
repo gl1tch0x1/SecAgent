@@ -142,6 +142,9 @@ class CrucibleValidator:
             if response.status_code in range(300, 500):
                 proven = False
                 signal = "Redirect or client-error response cannot establish proof"
+            elif not policy.negative_control and response.status_code >= 500:
+                proven = False
+                signal = "Server-error response cannot establish passive proof"
 
             observations = [
                 {
@@ -178,7 +181,7 @@ class CrucibleValidator:
                         )
                     )
                 enforce_scope(control_url)
-                control = await self._get(control_url)
+                control = await self._get(control_url, **kwargs)
                 control_headers = {k.lower(): v for k, v in control.headers.items()}
                 control_positive, _ = verify_finding(
                     key, control.text[:100_000], control_headers, payload
@@ -218,7 +221,9 @@ class CrucibleValidator:
                 "method": method,
                 "status_code": response.status_code,
                 "signal": signal,
-                "control_used": bool(payload),
+                "control_used": any(
+                    observation["role"] == "negative_control" for observation in observations
+                ),
                 "policy_version": "2.0",
                 "evidence_class": policy.evidence_class,
                 "minimum_positive_runs": policy.minimum_positive_runs,

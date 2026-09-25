@@ -86,16 +86,24 @@ class SkillManager:
 
     async def notify_invocation(self, skill_name: str, action: str):
         """Trigger mandatory voice notification if applicable."""
+        if not skill_name:
+            logger.warning("Notification attempted without a valid skill name")
+            return
+
         try:
             import httpx
 
             message = f"Running the {skill_name} workflow in the SecAgents system to {action}"
-            # Use a short timeout to not block agent execution if notification server is down
             async with httpx.AsyncClient(timeout=0.5) as client:
-                await client.post("http://localhost:8888/notify", json={"message": message})
-        except Exception:
-            # Silently fail if notification server is not reachable, per 'best of the best' robustness
-            pass
+                response = await client.post("http://localhost:8888/notify", json={"message": message})
+                response.raise_for_status()
+        except Exception as exc:
+            logger.warning(
+                "Failed to notify workflow invocation for '%s' action '%s': %s",
+                skill_name,
+                action,
+                exc,
+            )
 
 
 # Global singleton

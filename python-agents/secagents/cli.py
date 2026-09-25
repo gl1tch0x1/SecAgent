@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import re
 import subprocess
@@ -30,6 +31,8 @@ from rich.theme import Theme
 from rich.box import ROUNDED, DOUBLE_EDGE
 
 from secagents import __version__
+from secagents.config import load_runtime_config
+from secagents.infra.telemetry import MetricsCollector, configure_logging
 from secagents.operational.integrity import check_and_apply_tool_update
 from secagents.vault.env_loader import Vault
 from secagents.pipeline.runner import ScanPipeline
@@ -59,24 +62,24 @@ console = Console(theme=custom_theme)
 
 # ─── ASCII ARSENAL ───────────────────────────────────────────────────────────
 BANNER = r"""
-    _____           ___                    __
-   / ___/___  _____/   | ____ ____  ____  / /______
-   \__ \/ _ \/ ___/ /| |/ __ `/ _ \/ __ \/ __/ ___/
-  ___/ /  __/ /__/ ___ / /_/ /  __/ / / / /_(__  )
- /____/\___/\___/_/  |_\__, /\___/_/ /_/_/   \___/
-                      /____/
+   ____             __  ___   ____                 
+  / __ \___  ___   / / / _ | / __/___  ____  ____ 
+ / / / / _ \/ _ \ / / / __ |/ /_/ __ \/ __ \/ __ \
+/ /_/ /  __/  __// / / /_/ / __/ /_/ / / / / /_/ /
+\____/ \___|\___/_/  \____/_/  \____/_/_/ /_/ .___/
+                                          /_/     
 """
 
 
 def print_banner():
     banner_text = Text(BANNER, style="hacker")
     subtext = Text.from_markup(
-        f"\n[bold white]» AUTONOMOUS OFFENSIVE INTELLIGENCE FRAMEWORK «[/]\n[dim]VERSION {__version__} | RED TEAM OPERATIONS[/]\n"
+        f"\n[bold white]SECAGENT[/]\n[dim]Version {__version__} | authorized security assessment workflow[/]\n"
     )
     console.print(
         Panel(
             Group(banner_text, subtext),
-            border_style="#00ff00",
+            border_style="#66ffcc",
             box=DOUBLE_EDGE,
             expand=False,
             padding=(1, 2),
@@ -103,6 +106,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version", version=f"SecAgent {__version__}")
+    p.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+        help="Set the runtime logging verbosity for the CLI",
+    )
+    p.add_argument(
+        "--json-output",
+        action="store_true",
+        help="Emit structured JSON logs instead of plain text output",
+    )
 
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -216,14 +230,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def cmd_scan(args: argparse.Namespace) -> int:
-    if (
-        args.workers <= 0
-        or args.max_requests <= 0
-        or args.rate_limit <= 0
-        or args.max_duration <= 0
-    ):
-        console.print("[error]Workers and execution limits must be positive.[/error]")
+    try:
+        config = load_runtime_config(args)
+    except ValueError as exc:
+        console.print(f"[error]Configuration error:[/error] {exc}")
         return 2
+
+    args.workers = max(1, config.scan.workers)
+    args.max_requests = max(1, config.scan.max_requests)
+    args.rate_limit = max(0.1, config.scan.requests_per_second_per_host)
+    args.max_duration = max(1.0, config.scan.max_duration_seconds)
     if args.insecure:
         os.environ["SECAGENT_VERIFY_SSL"] = "false"
 
@@ -479,9 +495,23 @@ async def cmd_keyhacks(args: argparse.Namespace) -> int:
 
 def main() -> None:
     _load_env()
-    print_banner()
     parser = build_parser()
     args = parser.parse_args()
+
+    try:
+        runtime = load_runtime_config(args)
+    except ValueError as exc:
+        parser.exit(2, f"Configuration error: {exc}\n")
+
+    logger = configure_logging(runtime.log_level, runtime.json_output)
+    metrics = MetricsCollector()
+    metrics.increment("cli_invocations")
+    logger.info(
+        "secagent startup",
+        extra={"event": "cli.start", "target": runtime.target, "log_level": runtime.log_level},
+    )
+
+    print_banner()
 
     try:
         if args.command == "scan":

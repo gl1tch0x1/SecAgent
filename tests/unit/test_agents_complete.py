@@ -1,9 +1,7 @@
 """Complete test suite for all SecAgents agents — Updated for 0.3.0-dev."""
 
 import pytest
-import asyncio
-import json
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 # ============================================================================
 # SUPERVISOR AGENT TESTS
@@ -88,9 +86,11 @@ class TestWebSecurityAgent:
     """Test suite for web security agent."""
     
     @pytest.mark.asyncio
-    async def test_scan_execution(self):
+    async def test_scan_execution(self, monkeypatch):
         """Test web security scan execution."""
         from secagents.agents.web_security import WebSecurityAgent
+
+        monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
         
         agent = WebSecurityAgent()
         
@@ -114,10 +114,14 @@ class TestWebSecurityAgent:
             assert output.confidence >= 0.6
             assert "findings" in output.result
             assert output.result["endpoints_tested"] == 1
+            assert mock_get.call_count > 0
+            assert mock_get.call_args.args[0] == "http://example.com/search"
 
     @pytest.mark.asyncio
     async def test_signature_requires_clean_baseline_and_stays_manual(self, monkeypatch):
         from secagents.agents.web_security import WebSecurityAgent
+
+        monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
 
         agent = WebSecurityAgent()
 
@@ -135,6 +139,76 @@ class TestWebSecurityAgent:
         assert lead is not None
         assert lead["validation_status"] == "manual_lead"
         assert lead["validated"] is False
+
+    @pytest.mark.asyncio
+    async def test_absolute_inventory_url_uses_shared_budget(self, monkeypatch):
+        from secagents.agents.web_security import WebSecurityAgent
+        from secagents.infra.execution_budget import ExecutionBudget
+
+        monkeypatch.setenv("ALLOWED_DOMAINS", "example.com,api.example.com")
+        budget = ExecutionBudget(
+            max_requests=2,
+            requests_per_second_per_host=1000,
+            max_duration_seconds=10,
+        )
+        agent = WebSecurityAgent(budget=budget, auth_headers={"X-Scan-Session": "fixture"})
+        response = MagicMock(text="normal", status_code=200)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=response) as get:
+            output = await agent.execute({
+                "target": "https://example.com/app",
+                "endpoints": ["https://api.example.com/search"],
+                "vuln_types": ["sqli"],
+            })
+
+        assert get.call_count == 2
+        assert all(call.args[0] == "https://api.example.com/search" for call in get.call_args_list)
+        assert output.result["budget"]["requests_used"] == 2
+        assert output.result["budget"]["termination_reason"] == "request_limit_exceeded"
+        assert agent.budget is budget
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_inventory_url_sends_no_request(self, monkeypatch):
+        from secagents.agents.web_security import WebSecurityAgent
+
+        monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+        agent = WebSecurityAgent()
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as get:
+            output = await agent.execute({
+                "target": "https://example.com",
+                "endpoints": ["https://other.example.net/search"],
+                "vuln_types": ["sqli"],
+            })
+        get.assert_not_called()
+        assert output.result["budget"]["requests_used"] == 0
+
+    def test_relative_endpoint_uses_target_directory_without_query(self):
+        from secagents.agents.web_security import WebSecurityAgent
+
+        assert WebSecurityAgent._resolve_endpoint(
+            "https://example.com/app?session=private", "search"
+        ) == "https://example.com/app/search"
+
+    @pytest.mark.asyncio
+    async def test_specialist_ssrf_requires_callback_contract(self, monkeypatch):
+        from secagents.agents.web_security import WebSecurityAgent
+        from secagents.armada.handlers import build_scan_handlers
+
+        handlers = build_scan_handlers({"target": "example.com"})
+        result = await handlers["ssrf"](context={}, action="ssrf")
+        assert result["findings"] == []
+        assert "callback" in result["coverage_gap"]
+        assert "ssrf" not in WebSecurityAgent.VULN_SIGNATURES
+
+        monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as get:
+            output = await WebSecurityAgent().execute({
+                "target": "https://example.com",
+                "endpoints": ["/fetch"],
+                "vuln_types": ["ssrf"],
+            })
+        get.assert_not_called()
+        assert output.result["vuln_types_tested"] == 0
+        assert output.result["coverage_gaps"][0]["vuln_type"] == "ssrf"
 
 # ============================================================================
 # API SECURITY AGENT TESTS

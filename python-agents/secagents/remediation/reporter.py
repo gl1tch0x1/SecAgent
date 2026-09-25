@@ -15,12 +15,21 @@ SEVERITY_SCORE = {"critical": 10, "high": 7, "medium": 5, "low": 2, "info": 0}
 SECRET_FIELDS = frozenset(
     {
         "authorization",
+        "proxy-authorization",
         "cookie",
         "set-cookie",
         "api_key",
+        "x-api-key",
         "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
         "password",
         "secret",
+        "client_secret",
+        "session",
+        "session_id",
+        "csrf_token",
         "request_body",
     }
 )
@@ -38,7 +47,7 @@ def _redact(value):
     if isinstance(value, str):
         value = re.sub(r"(?i)(Bearer\s+)\S+", r"\1[REDACTED]", value)
         return re.sub(
-            r"(?i)([?&](?:api_key|token|password|secret|session|key)=)[^&#\s]+",
+            r"(?i)([?&](?:api_key|x-api-key|access_token|refresh_token|id_token|token|password|client_secret|secret|session|session_id|csrf_token|key)=)[^&#\s]+",
             r"\1[REDACTED]",
             value,
         )

@@ -142,6 +142,36 @@ async def test_active_proof_needs_negative_control_and_two_replays(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_active_negative_control_keeps_authentication(monkeypatch):
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    seen = []
+
+    def respond(request):
+        seen.append(request.headers.get("X-Scan-Session"))
+        if "secagent_negative_control" in str(request.url):
+            return httpx.Response(200, text="normal")
+        return httpx.Response(200, text="You have an error in your SQL syntax")
+
+    validator = CrucibleValidator()
+    await validator.aclose()
+    validator._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        outcome = await validator.validate_finding({
+            "url": "https://example.com/search",
+            "poc_url": "https://example.com/search?q=1%27",
+            "check_key": "sqli",
+            "request_method": "GET",
+            "request_headers": {"X-Scan-Session": "fixture-session"},
+            "payload_spec": {"method": "GET", "param": "q", "value": "1'"},
+        })
+        assert outcome["validated"] is True
+        assert seen == ["fixture-session"] * 4
+        assert outcome["proof"]["control_used"] is True
+    finally:
+        await validator.aclose()
+
+
+@pytest.mark.asyncio
 async def test_unproven_api_checks_do_not_send_writes_or_publish_findings(monkeypatch):
     monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
     agent = APISecurityAgent()

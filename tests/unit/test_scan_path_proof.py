@@ -72,6 +72,29 @@ async def test_passive_proof_replay_is_typed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_server_error_cannot_confirm_passive_configuration(monkeypatch):
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    validator = CrucibleValidator()
+    await validator.aclose()
+    validator._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(500, text="error"))
+    )
+    try:
+        outcome = await validator.validate_finding(
+            {
+                "url": "https://example.com/",
+                "poc_url": "https://example.com/",
+                "check_key": "missing_headers",
+                "request_method": "GET",
+            }
+        )
+        assert outcome["validated"] is False
+        assert outcome["validation_status"] == "rejected"
+    finally:
+        await validator.aclose()
+
+
+@pytest.mark.asyncio
 async def test_untyped_and_browser_only_signals_are_manual_leads(monkeypatch):
     monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
     validator = CrucibleValidator()

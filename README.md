@@ -79,7 +79,7 @@ Built for:
 8. **Hardware-Aware Local Fallback**: Automatically detects GPU/CPU capabilities to provision local Ollama models (`llama3`, `mistral`, `codellama`) when cloud APIs are unavailable.
 10. **Model Context Protocol (MCP) Server Mode**: Native JSON-RPC stdio server (`secagent mcp`) allowing Claude Code, Cursor, and VS Code Copilot to drive SecAgent with zero API cost.
 11. **Declarative YAML Playbooks**: Define and version-control complex pentesting methodologies with conditional rules and LLM decision gates (`secagent playbook`).
-12. **Portable Proof Capsules & Replay Engine**: Export verified vulnerabilities to `.json` proof capsules and re-prove them on demand via `secagent replay`.
+12. **Proof Capsule Replay Engine**: Replay a supplied typed `.json` proof capsule with `secagent replay`. The scan pipeline does not yet generate capsules automatically.
 13. **Human-In-The-Loop (HITL) Teleoperation**: Intercept double `Ctrl+C` during scan execution to drop into an interactive operator REPL (`step`, `inspect`, `inject`, `resume`, `abort`).
 14. **LLM Budget Guard & Cost Safeguard**: Real-time token cost accounting and configurable budget limit enforcement (`SECAGENT_PRICE_LIMIT`).
 
@@ -92,7 +92,7 @@ Built for:
 |  **Neural Swarm Orchestration** | `Orchestrator`, `ArmadaSwarm`, `TaskDAG` | Decomposes high-level objectives into directed acyclic execution graphs (DAGs) with retry and circuit breaker logic. |
 |  **MCP Server Mode** | `MCPServer`, JSON-RPC stdio | Exposes SecAgent tools to Claude Code, Cursor, and Copilot via Model Context Protocol (`secagent mcp`). |
 |  **Declarative Playbooks** | `Playbook`, `PlaybookRunner` | Executes YAML-defined scanning methodologies with dependency ordering and conditional execution (`secagent playbook`). |
-|  **Proof Capsules & Replay** | `ProofCapsule`, `ProofCapsuleReplayer` | Exports verified findings to portable `.json` capsules for instant offline replay & CI verification (`secagent replay`). |
+|  **Proof Capsules & Replay** | `ProofCapsule`, `ProofCapsuleReplayer` | Serializes supplied capsules and replays registered typed checks under scope and request limits. Authenticated capsules use environment references for session headers. |
 |  **HITL Teleoperation** | `TeleoperationController` | Intercepts double `Ctrl+C` to pause scan and launch interactive REPL shell. |
 |  **LLM Cost Safeguard** | `BudgetGuard` | Real-time token pricing and cost limit enforcement across OpenAI, Anthropic, Gemini, Groq, and OpenRouter. |
 |  **Aura Cognitive Memory** | `AuraMemoryManager`, Target DNA | Target DNA fingerprinting, WAF memory, payload pattern crystallization, automatic confidence reinforcement & decay (`secagent memory`). |
@@ -590,6 +590,8 @@ secagent playbook ./playbooks/web-api.yaml --target example.com
 secagent replay ./cog-ai-results/capsules/proof_sqli_123.json
 ```
 
+Capsules are supplied by the operator; regular scans do not write them. Serialization redacts session headers and request bodies. For authenticated replay, set `metadata.request_header_env` to a mapping such as `{"Authorization": "SECAGENT_REPLAY_AUTH"}` and set that environment variable locally. A capsule containing redacted request parameters or body is inconclusive until a fresh credential-free fixture is supplied.
+
 #### 5. `secagent memory` — Aura Cognitive Memory Control
 ```bash
 secagent memory [options]
@@ -677,7 +679,7 @@ SecAgent/
 │       │   ├── supervisor.py          # Action intent classifier & swarm director
 │       │   ├── validator.py           # Standalone lead classifier; live proof is in crucible/
 │       │   ├── web3_security.py       # Smart contract auditor (EVM & Solana vulnerability prober)
-│       │   └── web_security.py        # Web vulnerability scanner (SQLi, XSS, SSTI, LFI, SSRF, RCE)
+│       │   └── web_security.py        # Scoped specialist web probes; signature matches remain manual leads
 │       ├── armada/                    # Swarm Handlers & Orchestration Tasks
 │       │   ├── handlers.py            # Task handler registration & routing
 │       │   └── swarm.py               # Parallel agent swarm runner

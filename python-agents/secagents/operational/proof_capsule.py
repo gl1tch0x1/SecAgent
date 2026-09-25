@@ -13,6 +13,7 @@ from secagents.infra.scope import enforce_scope
 from secagents.infra.execution_budget import BudgetExceeded, ExecutionBudget
 from secagents.modules.cve_checks import verify_finding
 import os
+from secagents.remediation.reporter import _redact
 
 logger = logging.getLogger("secagents.proof_capsule")
 
@@ -33,7 +34,18 @@ class ProofCapsule:
     metadata: Dict[str, Any]
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        data = _redact(asdict(self))
+        # Capsules can be shared. Only headers with no credential semantics are
+        # portable; authenticated replay can read them from named environment
+        # variables via metadata.request_header_env.
+        public_headers = {"accept", "content-type", "user-agent"}
+        data["request_headers"] = {
+            key: value if key.lower() in public_headers else "[REDACTED]"
+            for key, value in data["request_headers"].items()
+        }
+        if data["request_body"] is not None:
+            data["request_body"] = "[REDACTED]"
+        return json.dumps(data, indent=2)
 
     @classmethod
     def from_json(cls, json_str: str) -> ProofCapsule:
@@ -83,8 +95,40 @@ class ProofCapsuleReplayer:
                 timeout=self.timeout, follow_redirects=False, verify=verify_ssl
             ) as client:
                 method = capsule.http_method.upper()
-                headers = capsule.request_headers or {}
+                headers = {
+                    key: value
+                    for key, value in (capsule.request_headers or {}).items()
+                    if value != "[REDACTED]"
+                }
+                header_env = capsule.metadata.get("request_header_env", {})
+                if not isinstance(header_env, dict):
+                    return False, "[INCONCLUSIVE] Invalid request_header_env mapping"
+                for header, env_name in header_env.items():
+                    if not isinstance(header, str) or not isinstance(env_name, str):
+                        return False, "[INCONCLUSIVE] Invalid credential environment reference"
+                    secret = os.environ.get(env_name)
+                    if not secret:
+                        return (
+                            False,
+                            f"[INCONCLUSIVE] Missing credential environment variable: {env_name}",
+                        )
+                    headers[header] = secret
+                if any(
+                    value == "[REDACTED]" and key not in header_env
+                    for key, value in (capsule.request_headers or {}).items()
+                ):
+                    return (
+                        False,
+                        "[INCONCLUSIVE] Capsule requires credential environment references",
+                    )
                 params = capsule.query_params or {}
+                if "[REDACTED]" in capsule.target_url or "[REDACTED]" in params.values():
+                    return False, "[INCONCLUSIVE] Capsule contains redacted request parameters"
+                if capsule.request_body == "[REDACTED]":
+                    return False, "[INCONCLUSIVE] Capsule contains a redacted request body"
+                payload_spec = capsule.metadata.get("payload_spec") or {}
+                if policy.negative_control and not payload_spec:
+                    return False, "[INCONCLUSIVE] Active capsule lacks a replayable payload"
                 async with self.budget.request(capsule.target_url):
                     resp = await client.request(
                         method,
@@ -94,21 +138,32 @@ class ProofCapsuleReplayer:
                         content=capsule.request_body,
                     )
                 response_headers = {k.lower(): v for k, v in resp.headers.items()}
+                if 300 <= resp.status_code < 500:
+                    return (
+                        False,
+                        "[INCONCLUSIVE] Redirect or client-error response cannot establish proof",
+                    )
+                if not policy.negative_control and resp.status_code >= 500:
+                    return (
+                        False,
+                        "[INCONCLUSIVE] Server-error response cannot establish passive proof",
+                    )
                 is_vulnerable, signal = verify_finding(
                     check_key,
                     resp.text[:100_000],
                     response_headers,
-                    capsule.metadata.get("payload_spec") or {},
+                    payload_spec,
                 )
-                payload_spec = capsule.metadata.get("payload_spec") or {}
-                if is_vulnerable and payload_spec:
+                if is_vulnerable and policy.negative_control:
                     base_url = capsule.metadata.get("base_url")
                     if not base_url:
                         return False, "[INCONCLUSIVE] Active capsule lacks a control URL"
+                    if "[REDACTED]" in base_url:
+                        return False, "[INCONCLUSIVE] Capsule contains a redacted control URL"
                     enforce_scope(base_url)
                     if method == "GET":
                         async with self.budget.request(base_url):
-                            control = await client.get(base_url)
+                            control = await client.get(base_url, headers=headers)
                     else:
                         return (
                             False,
