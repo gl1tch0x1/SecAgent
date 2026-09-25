@@ -33,6 +33,6 @@ Updated 25 September 2026. This file tracks changes made after the point-in-time
 1. Execute optional external binaries behind a proven scoped egress boundary that meters every target request; only then re-enable them. A configured provider endpoint is metered, but an arbitrary subprocess cannot satisfy the same contract yet.
 2. Verify the OAST protocol against a live operator-controlled service, including event integrity and callback retention. Confirm state cleanup under failures and cancellations on a disposable target; the current cleanup is best effort. Expand separate-identity fixtures to realistic authorization models.
 3. Expand the web/API corpus to independent applications and vulnerability classes. Repeat scans with equivalent module coverage and complete runs before publishing comparative precision, recall or performance claims.
-4. Run the configured Rust and C++ CI jobs on this change set and inspect their results. Their toolchains and a running Docker daemon were unavailable locally, and these uncommitted changes have not been pushed to CI.
+4. Run the configured Rust and C++ CI jobs on this change set and inspect their results. Their toolchains and a running Docker daemon were unavailable locally. The work is committed on a local branch; the user asked to keep it off GitHub for now, so CI has not run on this change set.
 
 The current default scan is suitable for further controlled development and authorized testing. It is **not yet a complete or industry-ready replacement for AKCA**.

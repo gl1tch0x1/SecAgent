@@ -13,6 +13,7 @@ from secagents.modules.cve_checks import RUN_CANARY
 from secagents.crucible.identity_proof import IdentityContract, prove_identity
 from secagents.crucible.state_contract import StateContract, observe_state_contract
 from secagents.crucible.oast_proof import SSRFContract, prove_ssrf
+from secagents.modules.oast_browser import OASTClient
 
 
 CASES = (
@@ -290,3 +291,31 @@ async def test_oast_proof_requires_scan_bound_independent_callbacks(monkeypatch)
     assert budget.snapshot()["requests_used"] == 8
     assert "provider-secret" not in str(result)
     assert "callback.example" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_oast_provider_cannot_return_cloud_metadata_callback(monkeypatch):
+    monkeypatch.setenv("OAST_PROVIDER_DOMAINS", "provider.example")
+    monkeypatch.setenv("OAST_CALLBACK_DOMAINS", "callback.example")
+
+    def respond(request):
+        return httpx.Response(
+            201,
+            json={
+                "registration_id": "registration_1",
+                "callback_url": "http://169.254.169.254/latest/meta-data/",
+            },
+        )
+
+    budget = ExecutionBudget(max_requests=2)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        provider = OASTClient(
+            "https://provider.example",
+            token="fixture-token",
+            budget=budget,
+            client=client,
+        )
+        with pytest.raises(RuntimeError, match="unapproved registration"):
+            await provider.register()
+    assert provider.callback_url is None
+    assert budget.snapshot()["requests_used"] == 1
