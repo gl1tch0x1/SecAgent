@@ -43,6 +43,7 @@ func TestHTTPProberInit(t *testing.T) {
 }
 
 func TestCrawler(t *testing.T) {
+	t.Setenv("ALLOWED_DOMAINS", "127.0.0.1,localhost")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")

@@ -10,6 +10,7 @@ import httpx
 from secagents.agents.base import BaseAgent, AgentConfig, AgentOutput, AgentRole
 from secagents.prompts import API_SECURITY_PROMPT
 from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.infra.execution_budget import BudgetExceeded, ExecutionBudget
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,8 @@ class APISecurityAgent(BaseAgent):
         )
         self.logger = logging.getLogger("secagents.api_security")
         self._client: Optional[httpx.AsyncClient] = None
+        self._coverage_gaps: list[dict] = []
+        self.budget = ExecutionBudget(max_requests=100, max_duration_seconds=300)
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -70,6 +73,7 @@ class APISecurityAgent(BaseAgent):
         self.logger.info(f"Testing {len(endpoints)} API endpoints")
 
         try:
+            self._coverage_gaps = []
             # Parse spec if provided
             if spec:
                 endpoints = self._parse_openapi_spec(spec, endpoints)
@@ -84,19 +88,12 @@ class APISecurityAgent(BaseAgent):
 
             result = {
                 "findings": findings,
+                "coverage_gaps": self._coverage_gaps,
                 "endpoints_tested": len(endpoints),
-                "test_types": [
-                    "bola",
-                    "mass_assignment",
-                    "rate_limiting",
-                    "jwt",
-                    "auth",
-                    "graphql",
-                    "cors",
-                ],
+                "test_types": [],
             }
 
-            self.logger.info(f"Found {len(findings)} API vulnerabilities")
+            self.logger.info(f"Found {len(findings)} validated API vulnerabilities")
 
             return self._format_output(
                 result=result,
@@ -122,8 +119,8 @@ class APISecurityAgent(BaseAgent):
     async def _test_endpoints(
         self, endpoints: list[dict], target: str, spec: Optional[dict]
     ) -> list[dict]:
-        findings = []
-        
+        findings: list[dict] = []
+
         # Validate all endpoints against ALLOWED_DOMAINS
         scoped_endpoints = []
         for ep in endpoints:
@@ -134,51 +131,25 @@ class APISecurityAgent(BaseAgent):
             except ScopeViolationError:
                 self.logger.debug(f"Endpoint {path} filtered by scope policy")
                 continue
-        
+
         for ep in scoped_endpoints:
             findings.extend(await self._test_endpoint(ep, target, spec))
         return findings
 
     async def _test_endpoint(self, endpoint: dict, target: str, spec: Optional[dict]) -> list[dict]:
-        findings = []
         path = endpoint.get("path", "")
         method = endpoint.get("method", "GET").upper()
-
-        self.logger.info(f"Testing {method} {path}")
-
-        try:
-            # Test for BOLA/IDOR
-            findings.extend(await self._test_bola(path, method, target))
-
-            # Test for mass assignment
-            findings.extend(await self._test_mass_assignment(path, method, target, endpoint))
-
-            # Test for rate limiting
-            findings.extend(await self._test_rate_limiting(path, method, target))
-
-            # Test for JWT vulnerabilities
-            findings.extend(await self._test_jwt_vulnerabilities(path, method, target))
-
-            # Test for auth bypass
-            findings.extend(await self._test_auth_bypass(path, method, target))
-
-            # Test for CORS
-            findings.extend(await self._test_cors(path, method, target))
-
-            # Test for MFA/SAML bypass
-            findings.extend(await self._test_mfa_saml_bypass(path, target))
-
-            # Test for GraphQL if path suggests it
-            if "graphql" in path.lower():
-                findings.extend(await self._test_graphql(path, target))
-
-        except Exception as e:
-            self.logger.error(f"Test failed for {path}: {str(e)}")
-
-        return findings
+        self._coverage_gaps.append(
+            {
+                "method": method,
+                "path": path,
+                "reason": "API exploit heuristics disabled until identity, state and typed proof policies are available",
+            }
+        )
+        return []
 
     async def _test_bola(self, path: str, method: str, target: str) -> list[dict]:
-        findings = []
+        findings: list[dict] = []
         if method not in ["GET", "PUT", "DELETE", "PATCH"]:
             return findings
 
@@ -210,7 +181,7 @@ class APISecurityAgent(BaseAgent):
     async def _test_mass_assignment(
         self, path: str, method: str, target: str, endpoint: dict
     ) -> list[dict]:
-        findings = []
+        findings: list[dict] = []
         if method not in ["POST", "PUT", "PATCH"]:
             return findings
 
@@ -382,8 +353,15 @@ class APISecurityAgent(BaseAgent):
         return findings
 
     async def _send_api_request(self, url: str, method: str, **kwargs) -> Optional[httpx.Response]:
+        if method.upper() not in {"GET", "HEAD"}:
+            self.logger.warning("API write request blocked without a state and cleanup policy")
+            return None
         try:
-            return await self.client.request(method, url, **kwargs)
+            async with self.budget.request(url):
+                return await self.client.request(method, url, **kwargs)
+        except (ScopeViolationError, BudgetExceeded) as exc:
+            self.logger.warning("API request blocked: %s", exc)
+            return None
         except Exception as e:
             self.logger.debug(f"API request failed: {str(e)}")
             return None

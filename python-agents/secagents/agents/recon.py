@@ -149,6 +149,7 @@ class ReconAgent(BaseAgent):
             sub = f"{prefix}.{clean_target}"
             url = f"https://{sub}"
             from secagents.core.native import native_engine
+
             # Fast C++ socket probe before full HTTP request
             probe_res = native_engine.probe_port(sub, 443, timeout_ms=1000)
             if not probe_res.get("open", False):
@@ -163,14 +164,21 @@ class ReconAgent(BaseAgent):
                     return {
                         "type": "subdomain",
                         "value": sub,
-                        "metadata": {"discovery_method": "native_cpp_probe", "status_code": resp.status_code, "latency_ms": probe_res.get("latency_ms", 0)},
+                        "metadata": {
+                            "discovery_method": "native_cpp_probe",
+                            "status_code": resp.status_code,
+                            "latency_ms": probe_res.get("latency_ms", 0),
+                        },
                         "priority": "high" if prefix in ["api", "admin"] else "medium",
                     }
             except Exception:
                 return {
                     "type": "subdomain",
                     "value": sub,
-                    "metadata": {"discovery_method": "native_cpp_socket_open", "latency_ms": probe_res.get("latency_ms", 0)},
+                    "metadata": {
+                        "discovery_method": "native_cpp_socket_open",
+                        "latency_ms": probe_res.get("latency_ms", 0),
+                    },
                     "priority": "medium",
                 }
 
@@ -205,20 +213,24 @@ class ReconAgent(BaseAgent):
         for scheme in ["https", "http"]:
             url = f"{scheme}://{clean_target}"
             try:
-                async with httpx.AsyncClient(timeout=4.0, verify=verify_ssl, follow_redirects=True) as client:
+                async with httpx.AsyncClient(
+                    timeout=4.0, verify=verify_ssl, follow_redirects=True
+                ) as client:
                     resp = await client.get(url)
                     server_header = resp.headers.get("server", "Unknown")
                     title_match = re.search(r"<title>(.*?)</title>", resp.text, re.IGNORECASE)
                     page_title = title_match.group(1).strip() if title_match else "No Title"
 
-                    findings.append({
-                        "type": "http_service",
-                        "url": str(resp.url),
-                        "status_code": resp.status_code,
-                        "title": page_title,
-                        "technology": server_header,
-                        "priority": "high" if resp.status_code == 200 else "medium",
-                    })
+                    findings.append(
+                        {
+                            "type": "http_service",
+                            "url": str(resp.url),
+                            "status_code": resp.status_code,
+                            "title": page_title,
+                            "technology": server_header,
+                            "priority": "high" if resp.status_code == 200 else "medium",
+                        }
+                    )
             except Exception as e:
                 self.logger.debug(f"HTTP probe failed for {url}: {e}")
 
@@ -238,19 +250,25 @@ class ReconAgent(BaseAgent):
         verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
 
         try:
-            async with httpx.AsyncClient(timeout=5.0, verify=verify_ssl, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=5.0, verify=verify_ssl, follow_redirects=True
+            ) as client:
                 resp = await client.get(base_url)
                 if resp.status_code == 200:
                     # Extract links from href attributes
                     links = set(re.findall(r'href=["\'](/[^"\']+)["\']', resp.text))
                     for path in list(links)[:20]:
-                        findings.append({
-                            "type": "endpoint",
-                            "path": path,
-                            "method": "GET",
-                            "status_code": 200,
-                            "priority": "high" if any(k in path for k in ["admin", "api", "login"]) else "medium",
-                        })
+                        findings.append(
+                            {
+                                "type": "endpoint",
+                                "path": path,
+                                "method": "GET",
+                                "status_code": 200,
+                                "priority": "high"
+                                if any(k in path for k in ["admin", "api", "login"])
+                                else "medium",
+                            }
+                        )
         except Exception as e:
             self.logger.warning(f"Crawl failed on {target}: {e}")
 
@@ -273,16 +291,20 @@ class ReconAgent(BaseAgent):
             async with httpx.AsyncClient(timeout=4.0, verify=verify_ssl) as client:
                 resp = await client.get(base_url)
                 # Find input names from HTML form fields
-                inputs = set(re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', resp.text, re.IGNORECASE))
+                inputs = set(
+                    re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', resp.text, re.IGNORECASE)
+                )
                 for param in list(inputs)[:10]:
-                    findings.append({
-                        "type": "parameter",
-                        "endpoint": base_url,
-                        "parameter": param,
-                        "method": "POST",
-                        "location": "body",
-                        "priority": "high",
-                    })
+                    findings.append(
+                        {
+                            "type": "parameter",
+                            "endpoint": base_url,
+                            "parameter": param,
+                            "method": "POST",
+                            "location": "body",
+                            "priority": "high",
+                        }
+                    )
         except Exception as e:
             self.logger.debug(f"Param discovery failed on {target}: {e}")
 
@@ -293,4 +315,3 @@ class ReconAgent(BaseAgent):
             "status": "completed",
             "findings": findings,
         }
-

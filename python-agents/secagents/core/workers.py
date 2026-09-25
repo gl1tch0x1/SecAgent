@@ -32,7 +32,7 @@ class Worker:
 @dataclass
 class QueuedTask:
     id: str
-    executor: Callable = field(default_factory=lambda: (lambda **kw: None))
+    executor: Callable = field(default_factory=lambda: lambda **kw: None)
     args: dict = field(default_factory=dict)
     priority: int = 0  # lower = higher priority
     created_at: float = field(default_factory=time.time)
@@ -40,6 +40,7 @@ class QueuedTask:
 
     def __lt__(self, other: QueuedTask) -> bool:
         return self.created_at < other.created_at
+
 
 # Compatibility alias for task queue
 Task = QueuedTask
@@ -68,7 +69,9 @@ class TaskQueue:
 class WorkerPool:
     """Async worker pool with heartbeat monitoring and task queue."""
 
-    def __init__(self, size: int = 4, num_workers: int | None = None, heartbeat_interval: float = 5.0):
+    def __init__(
+        self, size: int = 4, num_workers: int | None = None, heartbeat_interval: float = 5.0
+    ):
         self.size = num_workers if num_workers is not None else size
         self._workers: dict[str, Worker] = {}
         self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
@@ -86,8 +89,8 @@ class WorkerPool:
         for _ in range(self.size):
             w = Worker()
             self._workers[w.id] = w
-            task = asyncio.create_task(self._worker_loop(w))
-            self._tasks.append(task)
+            worker_task = asyncio.create_task(self._worker_loop(w))
+            self._tasks.append(worker_task)
         self._tasks.append(asyncio.create_task(self._heartbeat_monitor()))
 
     async def stop(self) -> None:
@@ -157,7 +160,7 @@ class WorkerPool:
 
     @property
     def stats(self) -> dict:
-        states = {}
+        states: dict[str, int] = {}
         for w in self._workers.values():
             states[w.state.value] = states.get(w.state.value, 0) + 1
         return {

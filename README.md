@@ -77,10 +77,10 @@ Built for:
 1. **Pure CLI-First Architecture**: No bloated web UI or complex database setup required. Designed for headless VPS execution, Docker containers, SSH sessions, and CI/CD pipelines.
 2. **Polyglot Performance Engine**: High-speed Go microservices for concurrent network probing, Rust for microsecond priority scheduling, C++20 for SIMD regex signature matching, and Python for LLM multi-agent reasoning.
 3. **Aura Cognitive Memory Engine**: Target DNA layering, payload pattern crystallization, decay-reinforcement mechanisms, and WAF fingerprint memory across scan missions (`secagent memory`).
-4. **Zero False-Positive Live Validation**: Integrated `CrucibleValidator` replays proof-of-concept payloads with HTTP status code consistency & response body variance checks against target endpoints.
+4. **Typed Live Validation**: `CrucibleValidator` replays supported checks and compares active probes with an unmodified control. XSS uses a scoped real-browser canary replay. Identity, state and SSRF proof require explicit operator contracts.
 5. **Shared Connection Pooling & High Concurrency**: Connection-pooled `CVEScanner` and concurrent `WebSecurityAgent` scanning via `asyncio.Semaphore` task dispatching.
 6. **Headless Browser Inspection**: `BrowserAgent` automated Chrome DOM extraction & dynamic Playwright form parsing with fallback HTTP inspection.
-7. **Strict SSL/TLS Enforcement**: Environment-controlled dynamic SSL verification (`SECAGENT_VERIFY_SSL`) across all agent HTTP clients.
+7. **TLS Verification in the Default Scan**: The default HTTP scan verifies TLS unless `--insecure` is set. Audit optional standalone agents separately before use.
 8. **Hardware-Aware Local Fallback**: Automatically detects GPU/CPU capabilities to provision local Ollama models (`llama3`, `mistral`, `codellama`) when cloud APIs are unavailable.
 10. **Model Context Protocol (MCP) Server Mode**: Native JSON-RPC stdio server (`secagent mcp`) allowing Claude Code, Cursor, and VS Code Copilot to drive SecAgent with zero API cost.
 11. **Declarative YAML Playbooks**: Define and version-control complex pentesting methodologies with conditional rules and LLM decision gates (`secagent playbook`).
@@ -387,7 +387,7 @@ secagent scan --target example.com --depth standard
 | **OS** | Windows / Linux / macOS | Linux / macOS / WSL2 | Fully supported on native Windows PowerShell & Linux |
 | **Python** | 3.11+ | Python 3.11, 3.12, 3.13 | Verified compatibility across environments |
 | **Git** | Installed | Latest | Version control & update engine |
-| **Docker** | *(Optional)* | 20.10+ | Containerized sandbox execution (`--no-sandbox` to bypass) |
+| **Docker** | *(Optional)* | 20.10+ | Not used for the Python scan path; scan handlers execute on the host |
 
 ---
 
@@ -518,12 +518,23 @@ Options:
   --depth {quick,standard,deep}  Scan intensity (default: standard)
   --workers, -w INT       Parallel agent swarm size (default: 4)
   --skip-os-check         Bypass OS security baseline check
-  --no-sandbox            Bypass Docker Fortress isolation
   --no-arsenal            Skip heuristic Arsenal probes
   --insecure              Bypass SSL/TLS verification
+  --max-requests INT      Maximum built-in HTTP requests (default: 1000)
+  --rate-limit FLOAT      Requests per second per host (default: 5)
+  --max-duration FLOAT    Scan deadline in seconds (default: 900)
+  --header-env NAME       Read one session header from an environment variable
+  --identity-contract PATH  Two-identity private resource proof contract
+  --state-contract PATH     State read, write, control and cleanup contract
+  --ssrf-contract PATH      Approved OAST callback proof contract
+  --cookie-env NAME       Read a Cookie header from an environment variable
+  --api-spec PATH         Import OpenAPI/Swagger request templates
+  --har PATH              Import captured request templates from a HAR file
   --setup-local-llm       Auto-provision local Ollama model
   --results-dir PATH      Output directory for deliverables (default: cog-ai-results)
 ```
+
+The bounded default scan meters built-in HTTP requests and configured Shodan/Chaos provider requests. Optional external binaries remain disabled because their internal traffic cannot be metered by this budget. Imported OpenAPI/HAR write methods remain unsent without an explicit state contract. Browser discovery and XSS proof require Playwright and Chromium. The [proof contract guide](docs/PROOF_CONTRACTS.md) describes opt-in identity, state and OAST cases and their limits.
 
 #### 2. `secagent vault` — Key Integrity Manager
 ```bash
@@ -579,7 +590,7 @@ secagent update
 
 ## Executive Summary
 SecAgent executed an autonomous security audit against target domain `example.com`. 
-A total of **3 validated vulnerabilities** were extracted with zero false positives.
+This example shows **3 validated findings**. The report also lists candidates that need manual proof and any incomplete scan coverage.
 
 ### Key Finding Matrix
 | Severity | Vulnerability | Location | Confidence | CWE |
@@ -730,11 +741,8 @@ SecAgent/
 
 ### Common Operational Scenarios
 
-#### 1. Bypassing Docker Sandbox Isolation
-If Docker is not running or sandbox isolation is not required:
-```bash
-secagent scan --target example.com --no-sandbox
-```
+#### 1. Runtime isolation
+The Python scan handlers execute on the host. Fortress is not used as an isolation boundary. Run SecAgent in an operator-managed container or virtual machine when isolation is required.
 
 #### 2. Provisioning Offline Local LLM Models
 When running in air-gapped environments without cloud API keys:

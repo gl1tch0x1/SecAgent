@@ -247,29 +247,9 @@ class Orchestrator:
                 tools=["universal_analyzer"],
                 memory_scope="runtime",
             )
-            # Phase 3: Validation (depends on scan)
-            validate = Task(
-                intent=Intent.VALIDATE,
-                agent="validator",
-                action="validate",
-                input={},
-                depends_on=[scan.id],
-                model_hint="reasoning",
-                tools=["http_request", "poc_generate"],
-                memory_scope="runtime",
-            )
-            # Phase 4: Report generation (depends on validation)
-            report = Task(
-                intent=Intent.REPORT,
-                agent="report",
-                action="generate",
-                input={},
-                depends_on=[validate.id],
-                model_hint="fast",
-                tools=["report_generate"],
-                memory_scope="persistent",
-            )
-            graph.tasks = [recon, scan, validate, report]
+            # The scan pipeline owns proof validation and reporting. Running those
+            # stages here duplicated validation and could publish intermediate data.
+            graph.tasks = [recon, scan]
 
         elif intent == Intent.AI_SAFETY:
             graph.tasks = [
@@ -373,6 +353,7 @@ class Orchestrator:
 
         executor = self._agents.get(agent_name)
         if not executor:
+
             def default_executor(action, input_data):
                 return {"status": "completed", "action": action, "agent": agent_name}
 
@@ -394,8 +375,8 @@ class Orchestrator:
         Returns:
             Dictionary with aggregated results keyed by agent names.
         """
-        aggregated = {}
-        errors = []
+        aggregated: dict[str, Any] = {}
+        errors: list[dict] = []
 
         for task in graph.tasks:
             if task.state == TaskState.DONE and task.output:
@@ -676,7 +657,11 @@ class Orchestrator:
         }
 
     async def execute_workflow(
-        self, intent: Intent | str, target: str = "", scope: str = "", context: Optional[dict] = None
+        self,
+        intent: Intent | str,
+        target: str = "",
+        scope: str = "",
+        context: Optional[dict] = None,
     ) -> dict:
         """Execute workflow for a specified intent and target context."""
         ctx = context or {}

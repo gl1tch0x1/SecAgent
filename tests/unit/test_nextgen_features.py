@@ -38,7 +38,14 @@ def test_proof_capsule_serialization(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_proof_capsule_replay_async():
+async def test_proof_capsule_replay_async(monkeypatch):
+    import httpx
+    from secagents.operational import proof_capsule
+
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="OK"))
+    monkeypatch.setattr(proof_capsule.httpx, "AsyncClient", lambda **kwargs: original_client(transport=transport))
     capsule = ProofCapsule(
         id="cap-test",
         target_url="https://example.com",
@@ -51,7 +58,7 @@ async def test_proof_capsule_replay_async():
         query_params={},
         proof_signal="Example Domain",
         timestamp=time.time(),
-        metadata={},
+        metadata={"check_key": "missing_headers"},
     )
     replayer = ProofCapsuleReplayer(timeout_seconds=5.0)
     ok, msg = await replayer.replay_async(capsule)

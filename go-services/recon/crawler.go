@@ -35,6 +35,9 @@ func NewCrawler(maxDepth int, traceID ...string) *Crawler {
 		Client: &http.Client{
 			Timeout: 15 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if err := checkScope(req.URL.String()); err != nil {
+					return http.ErrUseLastResponse
+				}
 				if len(via) >= 3 {
 					return http.ErrUseLastResponse
 				}
@@ -73,6 +76,11 @@ func (c *Crawler) crawlURL(ctx context.Context, url string, depth int, results c
 	}
 	if _, loaded := c.visited.LoadOrStore(url, true); loaded {
 		return
+	}
+
+	// Validate URL against ALLOWED_DOMAINS before crawling
+	if err := checkScope(url); err != nil {
+		return // Skip URLs not in allowed list
 	}
 
 	select {

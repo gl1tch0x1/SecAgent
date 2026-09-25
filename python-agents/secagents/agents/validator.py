@@ -76,7 +76,7 @@ class ValidatorAgent(BaseAgent):
             results = await asyncio.gather(*validation_tasks, return_exceptions=True)
 
             for finding, result in zip(high_conf_findings, results):
-                if isinstance(result, Exception):
+                if isinstance(result, BaseException):
                     self.logger.warning(f"Validation failed: {str(result)}")
                     inconclusive.append({**finding, "validation_status": "error"})
                 elif result["is_valid"]:
@@ -201,22 +201,34 @@ class ValidatorAgent(BaseAgent):
         self.logger.info(f"Replaying live PoC request to: {poc_url}")
 
         try:
-            async with httpx.AsyncClient(timeout=8.0, verify=verify_ssl, follow_redirects=True) as client:
+            from secagents.infra.scope import enforce_scope
+
+            enforce_scope(poc_url)
+            async with httpx.AsyncClient(
+                timeout=8.0, verify=verify_ssl, follow_redirects=False
+            ) as client:
                 method = finding.get("method", "GET").upper()
                 payload = finding.get("payload", "")
                 content_type = finding.get("metadata", {}).get("content_type", "")
 
                 if method in ["POST", "PUT", "PATCH"]:
-                    if "json" in content_type.lower() or (isinstance(payload, str) and payload.strip().startswith(("{", "["))):
+                    if "json" in content_type.lower() or (
+                        isinstance(payload, str) and payload.strip().startswith(("{", "["))
+                    ):
                         try:
                             json_data = json.loads(payload)
                             resp = await client.request(method, poc_url, json=json_data)
                         except Exception:
                             resp = await client.request(
-                                method, poc_url, content=payload, headers={"Content-Type": "application/json"}
+                                method,
+                                poc_url,
+                                content=payload,
+                                headers={"Content-Type": "application/json"},
                             )
                     else:
-                        resp = await client.request(method, poc_url, data={"data": payload} if payload else None)
+                        resp = await client.request(
+                            method, poc_url, data={"data": payload} if payload else None
+                        )
                 else:
                     resp = await client.get(poc_url)
 
@@ -226,13 +238,6 @@ class ValidatorAgent(BaseAgent):
                         "valid": True,
                         "proof_found": True,
                         "proof_signal": proof_signal,
-                        "status_code": resp.status_code,
-                    }
-                elif resp.status_code < 500 and (finding.get("deterministic") or finding.get("validated")):
-                    return {
-                        "valid": True,
-                        "proof_found": False,
-                        "reason": f"Live HTTP {resp.status_code} response confirmed",
                         "status_code": resp.status_code,
                     }
                 else:
@@ -253,11 +258,15 @@ class ValidatorAgent(BaseAgent):
 
         try:
             results = []
-            async with httpx.AsyncClient(timeout=5.0, verify=verify_ssl, follow_redirects=True) as client:
+            async with httpx.AsyncClient(
+                timeout=5.0, verify=verify_ssl, follow_redirects=True
+            ) as client:
                 for i in range(3):
                     try:
                         resp = await client.get(poc_url)
-                        results.append({"attempt": i + 1, "status": resp.status_code, "len": len(resp.text)})
+                        results.append(
+                            {"attempt": i + 1, "status": resp.status_code, "len": len(resp.text)}
+                        )
                     except Exception:
                         results.append({"attempt": i + 1, "status": 0, "len": 0})
 

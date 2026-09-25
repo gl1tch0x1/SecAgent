@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import re
 import time
 from typing import Optional
 
@@ -207,7 +206,7 @@ class WebSecurityAgent(BaseAgent):
 
         # 1. URL double encoding
         mutations.append(urllib.parse.quote(urllib.parse.quote(payload)))
-        
+
         # 2. SQLi specific comment obfuscation
         if vuln_type == "sqli":
             mutations.append(payload.replace(" ", "/**/"))
@@ -218,7 +217,9 @@ class WebSecurityAgent(BaseAgent):
         elif vuln_type == "xss":
             mutations.append(payload.replace("<", "%3C").replace(">", "%3E"))
             mutations.append(payload.replace("alert", "prompt").replace("1", "document.domain"))
-            mutations.append(f"<svg/onload={payload.replace('<script>', '').replace('</script>', '')}>")
+            mutations.append(
+                f"<svg/onload={payload.replace('<script>', '').replace('</script>', '')}>"
+            )
 
         # 4. Command Injection obfuscation
         elif vuln_type in ("rce", "cmdi"):
@@ -232,7 +233,9 @@ class WebSecurityAgent(BaseAgent):
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
             verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
-            self._client = httpx.AsyncClient(timeout=10.0, follow_redirects=True, verify=verify_ssl)
+            self._client = httpx.AsyncClient(
+                timeout=10.0, follow_redirects=False, verify=verify_ssl
+            )
         return self._client
 
     def base_system_prompt(self) -> str:
@@ -414,6 +417,7 @@ class WebSecurityAgent(BaseAgent):
     def _check_response(self, response: str, patterns: list[str]) -> bool:
         """Check response for vulnerability patterns using native C++ engine when available."""
         from secagents.core.native import native_engine
+
         for pattern in patterns:
             if native_engine.match_signature(response, pattern):
                 return True

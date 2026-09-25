@@ -19,15 +19,18 @@ impl Policy {
                 "domain {domain} is blocked"
             )));
         }
-        if !self.allowed_domains.is_empty() {
-            let allowed = self.allowed_domains.iter().any(|d| {
-                d == domain || (d.starts_with("*.") && domain.ends_with(&d[1..]))
-            });
-            if !allowed {
-                return Err(EngineError::PolicyViolation(format!(
-                    "domain {domain} not in allowlist"
-                )));
-            }
+        if self.allowed_domains.is_empty() {
+            return Err(EngineError::PolicyViolation(
+                "ALLOWED_DOMAINS is not configured. Set it via environment variable before scanning".to_string()
+            ));
+        }
+        let allowed = self.allowed_domains.iter().any(|d| {
+            d == domain || (d.starts_with("*.") && domain.ends_with(&d[1..]))
+        });
+        if !allowed {
+            return Err(EngineError::PolicyViolation(format!(
+                "domain {domain} not in ALLOWED_DOMAINS"
+            )));
         }
         Ok(())
     }

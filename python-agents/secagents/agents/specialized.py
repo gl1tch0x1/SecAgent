@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict
 import httpx
 
 from secagents.agents.base import BaseAgent, AgentOutput, AgentConfig, AgentRole
-from secagents.arsenal.registry import ToolRegistry
 
 
 class IntelligentDecisionEngine(BaseAgent):
@@ -86,7 +83,11 @@ class CTFWorkflowManager(BaseAgent):
         flag = None
 
         # Inspect challenge input for flag pattern
-        flag_match = re.search(r"(flag\{[^{}]+\}|CTF\{[^{}]+\}|secagent\{[^{}]+\})", str(challenge_input), re.IGNORECASE)
+        flag_match = re.search(
+            r"(flag\{[^{}]+\}|CTF\{[^{}]+\}|secagent\{[^{}]+\})",
+            str(challenge_input),
+            re.IGNORECASE,
+        )
         if flag_match:
             flag = flag_match.group(1)
 
@@ -108,7 +109,9 @@ class CVEIntelligenceManager(BaseAgent):
         super().__init__(AgentConfig(role=AgentRole.RECON, name="cve_intelligence_manager"))
 
     def base_system_prompt(self) -> str:
-        return "CVE Intelligence Manager for correlating software versions with known vulnerabilities."
+        return (
+            "CVE Intelligence Manager for correlating software versions with known vulnerabilities."
+        )
 
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
         software = task.get("software", "")
@@ -219,7 +222,9 @@ class TechnologyDetector(BaseAgent):
         if target:
             try:
                 url = target if target.startswith("http") else f"https://{target}"
-                async with httpx.AsyncClient(timeout=5.0, verify=verify_ssl, follow_redirects=True) as client:
+                async with httpx.AsyncClient(
+                    timeout=5.0, verify=verify_ssl, follow_redirects=True
+                ) as client:
                     resp = await client.get(url)
                     server = resp.headers.get("server", "")
                     powered_by = resp.headers.get("x-powered-by", "")
@@ -302,6 +307,7 @@ class PerformanceMonitor(BaseAgent):
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
         try:
             import psutil
+
             cpu_pct = psutil.cpu_percent(interval=0.1)
             ram_mb = psutil.Process().memory_info().rss / (1024 * 1024)
         except ImportError:
@@ -325,7 +331,13 @@ class ParameterOptimizer(BaseAgent):
 
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
         depth = task.get("depth", "standard")
-        flags = "-T4 --max-retries 2" if depth == "quick" else "-T4 --max-retries 3" if depth == "standard" else "-T5 -A"
+        flags = (
+            "-T4 --max-retries 2"
+            if depth == "quick"
+            else "-T4 --max-retries 3"
+            if depth == "standard"
+            else "-T5 -A"
+        )
 
         return AgentOutput(
             agent=self.name,

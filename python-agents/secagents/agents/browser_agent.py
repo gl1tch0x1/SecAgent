@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import httpx
 
 from secagents.agents.base import AgentConfig, AgentOutput, AgentRole, BaseAgent
 from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.infra.execution_budget import BudgetExceeded, ExecutionBudget
 
 
 class BrowserAgent(BaseAgent):
@@ -23,7 +23,9 @@ class BrowserAgent(BaseAgent):
         self.logger = logging.getLogger(f"secagents.{name}")
 
     def base_system_prompt(self) -> str:
-        return "You are a Headless Browser Automation Agent inspecting DOM trees and dynamic traffic."
+        return (
+            "You are a Headless Browser Automation Agent inspecting DOM trees and dynamic traffic."
+        )
 
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
         """Execute headless browser automation and DOM extraction."""
@@ -37,7 +39,9 @@ class BrowserAgent(BaseAgent):
                 error="No target_url specified",
             )
 
-        target_url = raw_url if raw_url.startswith(("http://", "https://")) else f"https://{raw_url}"
+        target_url = (
+            raw_url if raw_url.startswith(("http://", "https://")) else f"https://{raw_url}"
+        )
 
         # Validate target URL against ALLOWED_DOMAINS
         try:
@@ -77,15 +81,30 @@ class BrowserAgent(BaseAgent):
 
     async def _analyze_page(self, url: str) -> dict[str, Any]:
         """Inspect page structure, security headers, forms using Playwright or httpx fallback."""
+        budget = ExecutionBudget(max_requests=50, max_duration_seconds=30)
         try:
             from playwright.async_api import async_playwright  # type: ignore[import-not-found,import-untyped]
 
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                browser = await p.chromium.launch(headless=True, channel="chromium")
+                context = await browser.new_context(
+                    ignore_https_errors=os.environ.get("SECAGENT_VERIFY_SSL", "true").lower()
+                    == "false",
+                    service_workers="block",
                 )
-                context = await browser.new_context(ignore_https_errors=True)
+
+                async def scoped_route(route):
+                    try:
+                        enforce_scope(route.request.url)
+                        if route.request.method not in {"GET", "HEAD"}:
+                            raise ScopeViolationError("Browser write request blocked")
+                        async with budget.request(route.request.url):
+                            response = await route.fetch(max_redirects=0)
+                        await route.fulfill(response=response)
+                    except (ScopeViolationError, BudgetExceeded):
+                        await route.abort()
+
+                await context.route("**/*", scoped_route)
                 page = await context.new_page()
 
                 js_errors: list[str] = []
@@ -112,9 +131,13 @@ class BrowserAgent(BaseAgent):
                     "forms": forms,
                     "js_errors": js_errors,
                     "security_headers": {
-                        "Content-Security-Policy": headers.get("content-security-policy", "missing"),
+                        "Content-Security-Policy": headers.get(
+                            "content-security-policy", "missing"
+                        ),
                         "X-Frame-Options": headers.get("x-frame-options", "missing"),
-                        "Strict-Transport-Security": headers.get("strict-transport-security", "missing"),
+                        "Strict-Transport-Security": headers.get(
+                            "strict-transport-security", "missing"
+                        ),
                     },
                     "engine": "playwright-chromium",
                 }
@@ -122,31 +145,48 @@ class BrowserAgent(BaseAgent):
             self.logger.debug(f"Playwright navigation failed for {url}, falling back to httpx: {e}")
             try:
                 verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
-                async with httpx.AsyncClient(timeout=6.0, verify=verify_ssl, follow_redirects=True) as client:
-                    resp = await client.get(url)
-                    headers = dict(resp.headers)
-                    html = resp.text
+                async with httpx.AsyncClient(
+                    timeout=6.0, verify=verify_ssl, follow_redirects=False
+                ) as client:
+                    async with budget.request(url):
+                        http_response = await client.get(url)
+                    headers = dict(http_response.headers)
+                    html_text = http_response.text
 
                     # Title extraction
-                    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-                    page_title = title_match.group(1).strip() if title_match else headers.get("server", "SecAgent Target Host")
+                    title_match = re.search(
+                        r"<title[^>]*>(.*?)</title>", html_text, re.IGNORECASE | re.DOTALL
+                    )
+                    page_title = (
+                        title_match.group(1).strip()
+                        if title_match
+                        else headers.get("server", "SecAgent Target Host")
+                    )
 
                     # Form extraction via regex
-                    form_blocks = re.findall(r"<form[^>]*>(.*?)</form>", html, re.IGNORECASE | re.DOTALL)
+                    form_blocks = re.findall(
+                        r"<form[^>]*>(.*?)</form>", html_text, re.IGNORECASE | re.DOTALL
+                    )
                     forms_extracted = []
                     for block in form_blocks:
-                        inputs = re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', block, re.IGNORECASE)
+                        inputs = re.findall(
+                            r'<input[^>]+name=["\']([^"\']+)["\']', block, re.IGNORECASE
+                        )
                         forms_extracted.append({"action": "", "method": "GET", "inputs": inputs})
 
                     return {
                         "title": page_title,
-                        "dom_count": html.count("<"),
+                        "dom_count": html_text.count("<"),
                         "forms": forms_extracted,
                         "js_errors": [],
                         "security_headers": {
-                            "Content-Security-Policy": headers.get("content-security-policy", "missing"),
+                            "Content-Security-Policy": headers.get(
+                                "content-security-policy", "missing"
+                            ),
                             "X-Frame-Options": headers.get("x-frame-options", "missing"),
-                            "Strict-Transport-Security": headers.get("strict-transport-security", "missing"),
+                            "Strict-Transport-Security": headers.get(
+                                "strict-transport-security", "missing"
+                            ),
                         },
                         "engine": "httpx-fallback",
                     }

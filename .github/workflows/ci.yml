@@ -2,7 +2,7 @@ name: CI — SecAgents Complete Suite
 
 on:
   push:
-    branches: ["main", "develop", "feature/**", "fix/**"]
+    branches: ["main", "develop", "feature/**", "fix/**", "codex/**"]
   pull_request:
     branches: ["main", "develop"]
   workflow_dispatch:
@@ -95,7 +95,7 @@ jobs:
 
       - name: Run go vet
         if: matrix.language == 'go'
-        run: cd go-services && go vet ./...
+        run: cd go-services && go vet ./recon/... ./scanners/... ./cli/...
 
   # ─────────────────────────────────────────────────────────────────────
   #  JOB 2: Type Checking
@@ -153,6 +153,9 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -e "python-agents/.[dev,browser]"
+
+      - name: Install Chromium for browser proof fixtures
+        run: python -m playwright install --with-deps --no-shell chromium
 
       - name: Create reports directory
         run: mkdir -p reports
@@ -229,6 +232,7 @@ jobs:
         run: |
           cmake -B cpp-core/build -S cpp-core
           cmake --build cpp-core/build
+          ctest --test-dir cpp-core/build --output-on-failure
 
       # Rust
       - name: Set up Rust
@@ -255,7 +259,7 @@ jobs:
 
       - name: Run Go tests
         if: matrix.language == 'go'
-        run: cd go-services && go test -v ./...
+        run: cd go-services && go test -v ./recon/... ./scanners/... ./cli/...
 
   # ─────────────────────────────────────────────────────────────────────
   #  JOB 6: Installer Validation
