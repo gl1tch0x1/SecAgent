@@ -6,6 +6,7 @@ import asyncio
 import os
 import shutil
 import time
+import uuid
 from typing import Any, Optional
 
 
@@ -24,8 +25,29 @@ class ProcessManager:
         env: Optional[dict[str, str]] = None,
     ) -> dict[str, Any]:
         """Execute a tool command asynchronously with stream capture and timeouts."""
-        cmd_str = command if isinstance(command, str) else " ".join(command)
-        proc_id = f"proc_{int(time.time() * 1000)}"
+        cmd_str = (
+            "<rejected shell command>"
+            if isinstance(command, str)
+            else (command[0] if command else "<empty>")
+        )
+        proc_id = f"proc_{uuid.uuid4().hex}"
+
+        if (
+            isinstance(command, str)
+            or not command
+            or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in command)
+        ):
+            return {
+                "proc_id": proc_id,
+                "command": cmd_str,
+                "returncode": 2,
+                "stdout": "",
+                "stderr": "A nonempty argument list is required; shell command strings are disabled",
+                "duration": 0.0,
+                "success": False,
+            }
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
 
         start_time = time.time()
         merged_env = os.environ.copy()
@@ -33,22 +55,13 @@ class ProcessManager:
             merged_env.update(env)
 
         try:
-            if isinstance(command, str):
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd,
-                    env=merged_env,
-                )
-            else:
-                proc = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd,
-                    env=merged_env,
-                )
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=merged_env,
+            )
 
             self.active_processes[proc_id] = proc
 
@@ -58,9 +71,10 @@ class ProcessManager:
                 )
                 stdout = stdout_bytes.decode("utf-8", errors="replace")
                 stderr = stderr_bytes.decode("utf-8", errors="replace")
-                returncode = proc.returncode or 0
+                returncode = proc.returncode if proc.returncode is not None else -1
             except asyncio.TimeoutError:
                 proc.kill()
+                await proc.communicate()
                 stdout = ""
                 stderr = f"Command timed out after {timeout} seconds"
                 returncode = -1

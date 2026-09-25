@@ -319,3 +319,25 @@ async def test_oast_provider_cannot_return_cloud_metadata_callback(monkeypatch):
             await provider.register()
     assert provider.callback_url is None
     assert budget.snapshot()["requests_used"] == 1
+@pytest.mark.asyncio
+async def test_403_bypass_is_get_only_and_requires_denied_baseline(monkeypatch):
+    from secagents.modules.bypass_403 import bypass_403
+
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    methods = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        if request.url.path == "/protected" and not request.headers.get("X-Forwarded-For"):
+            return httpx.Response(403, text="denied")
+        return httpx.Response(200, text="different")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        leads = await bypass_403("https://example.com/protected", "/protected", client=client)
+    assert leads
+    assert all(lead["status_label"] == "manual_lead" for lead in leads)
+    assert set(methods) == {"GET"}
+
+    methods.clear()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200))) as client:
+        assert await bypass_403("https://example.com/protected", "/protected", client=client) == []

@@ -115,6 +115,27 @@ class TestWebSecurityAgent:
             assert "findings" in output.result
             assert output.result["endpoints_tested"] == 1
 
+    @pytest.mark.asyncio
+    async def test_signature_requires_clean_baseline_and_stays_manual(self, monkeypatch):
+        from secagents.agents.web_security import WebSecurityAgent
+
+        agent = WebSecurityAgent()
+
+        async def reflected_for_every_request(endpoint, payload, target):
+            return "SQL syntax error"
+
+        monkeypatch.setattr(agent, "_send_payload", reflected_for_every_request)
+        assert await agent._test("/search", "sqli", "https://example.com") is None
+
+        async def distinct_probe(endpoint, payload, target):
+            return "normal" if payload == "safe_canary_value" else "SQL syntax error"
+
+        monkeypatch.setattr(agent, "_send_payload", distinct_probe)
+        lead = await agent._test("/search", "sqli", "https://example.com")
+        assert lead is not None
+        assert lead["validation_status"] == "manual_lead"
+        assert lead["validated"] is False
+
 # ============================================================================
 # API SECURITY AGENT TESTS
 # ============================================================================

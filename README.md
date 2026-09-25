@@ -2,9 +2,9 @@
   <img src="docs/assets/secagent_logo.png" alt="SecAgent Logo" width="380">
 </p>
 
-**Autonomous Offensive AI Framework for Red Teams & Security Researchers**
+**Authorized offensive security assessment toolkit**
 
-*Industrial Power. Elite Intelligence. Mission Ready.*
+SecAgent combines scoped discovery, bounded HTTP checks, proof replay, optional browser inspection, and operator-controlled identity, state, and callback workflows. Findings and manual leads are reported separately.
 
 ---
 
@@ -13,7 +13,6 @@
 [![C++ Core](https://img.shields.io/badge/core-c%2B%2B20-blue.svg)](https://isocpp.org/)
 [![Rust Core](https://img.shields.io/badge/core-rust-orange.svg)](https://www.rust-lang.org/)
 [![Go Recon](https://img.shields.io/badge/recon-go-cyan.svg)](https://go.dev/)
-[![Tests](https://img.shields.io/badge/tests-47%2F47%20passing-brightgreen.svg)](https://github.com/gl1tch0x1/cog-ai)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
 </div>
@@ -58,16 +57,12 @@
 
 ##  What Is SecAgent
 
-Traditional vulnerability scanners are **rigid, noisy, and context-blind.** They execute static pattern matching, miss complex multi-stage attack vectors, and flood security operators with false positives that waste valuable time.
-
-**SecAgent is an Autonomous, Pure-CLI Red Teaming & Offensive Intelligence Framework.**
-
-It operates as a **Distributed Cognitive Security Engine** — harnessing specialized multi-agent AI swarms that *reason* through attack surfaces the way an elite red-team operator does. SecAgent identifies technology stacks, enumerates subdomains and HTTP endpoints via active `httpx` and Go probes, crafts context-aware exploits, validates vulnerabilities through deterministic proof-of-concepts, and generates correlated, impact-first deliverables.
+SecAgent is a CLI toolkit for authorized security assessments. The default pipeline discovers scoped web routes, imports read-only API requests, runs bounded checks, and replays supported findings under explicit proof policies. Optional agents and native components provide additional workflows, but their presence in the repository does not imply that they run in the bounded default pipeline.
 
 Built for:
--  **Red Teams** executing full-scope autonomous engagements
--  **Security Researchers** performing automated attack surface discovery & zero-day research
--  **Bug Bounty Hunters** conducting active recon and vulnerability verification
+-  **Red Teams** operating within an approved scope and traffic budget
+-  **Security Researchers** examining web and API attack surfaces
+-  **Bug Bounty Hunters** reviewing candidate issues and proof evidence
 -  **Offensive AI Researchers** auditing AI supply chains, prompt injections, and RAG pipelines
 
 ---
@@ -75,12 +70,12 @@ Built for:
 ##  Key Differentiators
 
 1. **Pure CLI-First Architecture**: No bloated web UI or complex database setup required. Designed for headless VPS execution, Docker containers, SSH sessions, and CI/CD pipelines.
-2. **Polyglot Performance Engine**: High-speed Go microservices for concurrent network probing, Rust for microsecond priority scheduling, C++20 for SIMD regex signature matching, and Python for LLM multi-agent reasoning.
+2. **Optional Native Components**: Go, Rust, and C++ components exist in the repository; the bounded Python default scan does not depend on all of them.
 3. **Aura Cognitive Memory Engine**: Target DNA layering, payload pattern crystallization, decay-reinforcement mechanisms, and WAF fingerprint memory across scan missions (`secagent memory`).
 4. **Typed Live Validation**: `CrucibleValidator` replays supported checks and compares active probes with an unmodified control. XSS uses a scoped real-browser canary replay. Identity, state and SSRF proof require explicit operator contracts.
-5. **Shared Connection Pooling & High Concurrency**: Connection-pooled `CVEScanner` and concurrent `WebSecurityAgent` scanning via `asyncio.Semaphore` task dispatching.
+5. **Bounded Built-in Traffic**: Shared request count, per-host rate, concurrency, and deadline limits cover built-in discovery, checks, and proof replay.
 6. **Headless Browser Inspection**: `BrowserAgent` automated Chrome DOM extraction & dynamic Playwright form parsing with fallback HTTP inspection.
-7. **TLS Verification in the Default Scan**: The default HTTP scan verifies TLS unless `--insecure` is set. Audit optional standalone agents separately before use.
+7. **TLS Verification**: The default HTTP scan verifies TLS unless `--insecure` is set.
 8. **Hardware-Aware Local Fallback**: Automatically detects GPU/CPU capabilities to provision local Ollama models (`llama3`, `mistral`, `codellama`) when cloud APIs are unavailable.
 10. **Model Context Protocol (MCP) Server Mode**: Native JSON-RPC stdio server (`secagent mcp`) allowing Claude Code, Cursor, and VS Code Copilot to drive SecAgent with zero API cost.
 11. **Declarative YAML Playbooks**: Define and version-control complex pentesting methodologies with conditional rules and LLM decision gates (`secagent playbook`).
@@ -101,19 +96,21 @@ Built for:
 |  **HITL Teleoperation** | `TeleoperationController` | Intercepts double `Ctrl+C` to pause scan and launch interactive REPL shell. |
 |  **LLM Cost Safeguard** | `BudgetGuard` | Real-time token pricing and cost limit enforcement across OpenAI, Anthropic, Gemini, Groq, and OpenRouter. |
 |  **Aura Cognitive Memory** | `AuraMemoryManager`, Target DNA | Target DNA fingerprinting, WAF memory, payload pattern crystallization, automatic confidence reinforcement & decay (`secagent memory`). |
-|  **Active Recon Engine** | `ReconAgent`, `GoRecon`, `httpx` Prober | Active subdomain resolution, TLS/header probing, HTML crawling, link extraction, and GET/POST parameter discovery. |
+|  **Active Recon Engine** | `ReconAgent`, `GoRecon`, `httpx` Prober | Scoped HTTP probing, bounded subdomain checks, HTML link and form parameter discovery. |
 |  **Headless Browser Engine** | `BrowserAgent`, Playwright | Chromium DOM tree inspection, dynamic JS error tracking, and automated HTML form input extraction. |
-|  **Web Security Scanner** | `WebSecurityAgent`, `CVEChecks` | 31+ vulnerability classes including SQLi, XSS, SSTI, LFI, RFI, SSRF, RCE, Command Injection, Log4Shell, and multi-origin CORS checks. |
-|  **API Security Scanner** | `APISecurityAgent` | REST & GraphQL introspection, BOLA/IDOR detection (sensitive schema field evaluation), JWT algorithm manipulation (`none` alg), and CORS misconfigurations. |
+|  **Web Security Scanner** | `CVEScanner`, `CVEChecks` | Check catalog with typed policies; unsupported or capability-dependent checks remain manual leads or coverage gaps. |
+|  **API Inventory** | OpenAPI, Swagger, HAR | Preserves methods and bodies in memory; default active probes use GET templates only. Stateful writes require an explicit contract. |
 |  **12 Specialized Swarm Agents** | `specialized.py` | Functional AI swarm agents for intelligent tool selection, CTF challenge solving, exploit generation, vulnerability correlation, and rate-limit detection. |
 |  **Web3 & Contract Auditor** | `Web3SecurityAgent` | EVM & Solana smart contract security analysis for reentrancy, integer overflow, delegatecall vulnerabilities, and access control bypasses. |
-|  **PoC Verification** | `CrucibleValidator` | Live HTTP request replay with multi-attempt consistency validation to eliminate false positives. |
-|  **Exploit Chain Correlation** | `ChainCorrelator` | Links isolated vulnerabilities into complete end-to-end multi-step exploit paths. |
+|  **PoC Verification** | `CrucibleValidator` | Typed replay, controls, and evidence hashes for supported checks. This reduces unproven findings but does not establish a zero false-positive rate. |
+|  **Exploit Chain Correlation** | `ChainCorrelator` | Suggests hypotheses for operator review; a chain is not proof of exploitability. |
 |  **Impact-First Reporting** | `ReportAgent` | Generates executive Markdown reports and machine-readable JSON artifacts. |
 
 ---
 
 ##  Comprehensive System Architecture
+
+The diagrams below show repository components and optional integrations. They are not a claim that every component executes during `secagent scan`; the bounded default path is the Python scan pipeline described above.
 
 ### 1. High-Level System Topology & Polyglot Engine
 
@@ -534,7 +531,39 @@ Options:
   --results-dir PATH      Output directory for deliverables (default: cog-ai-results)
 ```
 
-The bounded default scan meters built-in HTTP requests and configured Shodan/Chaos provider requests. Optional external binaries remain disabled because their internal traffic cannot be metered by this budget. Imported OpenAPI/HAR write methods remain unsent without an explicit state contract. Browser discovery and XSS proof require Playwright and Chromium. The [proof contract guide](docs/PROOF_CONTRACTS.md) describes opt-in identity, state and OAST cases and their limits.
+The bounded default scan meters built-in HTTP requests and configured Shodan/Chaos provider requests. Optional external binaries remain disabled because their internal traffic cannot be metered by this budget. Browser discovery and XSS proof require Playwright and Chromium. The scan handlers run on the host; use an operator-managed container or virtual machine when runtime isolation is required. Reports record consumed budget, termination reason, findings, manual leads, and coverage gaps.
+
+### Opt-in proof contracts
+
+Set `ALLOWED_DOMAINS` to include every target host. Contract files must not contain secrets. Each `*_header_env` variable must hold one `Name: value` header. Session headers and callback tokens are read from the environment and omitted from report evidence.
+
+**Two-identity resource proof** (`--identity-contract`):
+
+```json
+[{"owner_url":"https://app.example/api/accounts/owner","other_control_url":"https://app.example/api/accounts/other","private_marker":"owner-private-marker","owner_header_env":"SECAGENT_OWNER_HEADER","other_header_env":"SECAGENT_OTHER_HEADER"}]
+```
+
+Use two distinct identities and a marker found only in the owner's private response. Two independent GET runs compare the owner, other, and anonymous responses. A finding requires the other identity to observe the private marker twice while controls remain clean; reports retain hashes and booleans, not credentials or the marker.
+
+**State observation** (`--state-contract`):
+
+```json
+[{"read_url":"https://app.example/api/items/fixture","write_url":"https://app.example/api/items/fixture","write_method":"PATCH","control_body":"{\"value\":\"baseline-value\"}","probe_body":"{\"value\":\"probe-value\"}","cleanup_url":"https://app.example/api/items/fixture","cleanup_method":"PATCH","cleanup_body":"{\"value\":\"baseline-value\"}","baseline_marker":"baseline-value","probe_marker":"probe-value","header_env":"SECAGENT_STATE_HEADER"}]
+```
+
+Use a disposable fixture record. Before writes, the runner requires 13 remaining request slots and 90 seconds. It reads the baseline, sends a negative control, repeats the probe, and attempts cleanup after every write. The observed transition remains a manual lead; failed cleanup is reported for operator repair. Imported OpenAPI/HAR writes are never sent without a contract.
+
+**Out-of-band SSRF proof** (`--ssrf-contract`):
+
+```json
+[{"probe_url":"https://app.example/api/fetch?url=about:blank","parameter":"url","provider_url":"https://oast-provider.example","provider_token_env":"SECAGENT_OAST_TOKEN"}]
+```
+
+Set `OAST_PROVIDER_DOMAINS` and `OAST_CALLBACK_DOMAINS` to the exact approved HTTPS hostnames. The provider must implement `POST /registrations` with a JSON `nonce` and return `registration_id` plus `callback_url`; `GET /registrations/{id}/events` must return events containing the same registration ID and nonce. Both calls use a bearer token. The proof requires two independent callbacks and an empty unsent control. No callback host is configured by default. This provider contract has been exercised with a controlled mock service; live provider integration remains to be verified.
+
+### Verification status and limits
+
+The local Python unit suite and Go tests have passed. The positive and negative web/API fixture corpus is small and cannot establish field precision or recall. Rust and C++ gates are configured in CI but were not run on this Windows host. A broader fixture corpus, measured resource use, live callback integration, and full cross-language CI results are still required before any production-readiness or comparative accuracy claim.
 
 #### 2. `secagent vault` — Key Integrity Manager
 ```bash
@@ -646,7 +675,7 @@ SecAgent/
 │       │   ├── recon.py               # Active DNS prober, httpx crawler, parameter discovery
 │       │   ├── report.py              # Markdown deliverable generator & finding summarizer
 │       │   ├── supervisor.py          # Action intent classifier & swarm director
-│       │   ├── validator.py           # Proof-of-Concept verification & replay engine
+│       │   ├── validator.py           # Standalone lead classifier; live proof is in crucible/
 │       │   ├── web3_security.py       # Smart contract auditor (EVM & Solana vulnerability prober)
 │       │   └── web_security.py        # Web vulnerability scanner (SQLi, XSS, SSTI, LFI, SSRF, RCE)
 │       ├── armada/                    # Swarm Handlers & Orchestration Tasks
@@ -666,8 +695,8 @@ SecAgent/
 │       │   ├── caveman.py             # Token-efficient prompt compressor
 │       │   ├── ci_notifier.py         # CI/CD webhook & alert dispatcher
 │       │   └── memory_graph.py        # Graph-based vulnerability relationship store
-│       ├── fortress/                  # Isolation & Sandboxing
-│       │   └── sandbox.py             # Docker Fortress execution isolation checks
+│       ├── fortress/                  # Legacy sandbox helper, outside the scan path
+│       │   └── sandbox.py             # Does not isolate scan handlers
 │       ├── hermes/                    # Retrospective Memory Engine
 │       │   ├── retrospective.py       # Post-scan analysis & learning feedback loop
 │       │   └── store.py               # Hermes persistent memory store
@@ -681,7 +710,7 @@ SecAgent/
 │       │   ├── consensus.py           # Multi-provider agreement & consensus engine
 │       │   └── omni.py                # Unified LLM client (OpenAI, Anthropic, Gemini, Groq, DeepSeek)
 │       ├── modules/                   # Deterministic Detection Signatures
-│       │   └── cve_checks.py          # 31+ zero-false-positive CVE signatures & check definitions
+│       │   └── cve_checks.py          # Check definitions and evidence signatures
 │       ├── operational/               # Environment & System Integrity
 │       │   └── integrity.py           # OS baseline security update & tool updater
 │       ├── pipeline/                  # Unified Scan Execution
@@ -725,7 +754,7 @@ SecAgent/
 │       ├── test_agents_complete.py    # Unit tests for python agent swarms
 │       ├── test_comprehensive.py      # System orchestrator & worker tests
 │       └── test_cve_checks.py         # Signature & CVE verification tests
-├── docker-compose.yml                 # Production background microservices configuration
+├── docker-compose.yml                 # Optional background services configuration
 ├── Makefile                           # Unified build, test, and execution targets
 ├── installer.py                       # Automated deployment & installation engine
 ├── update.py                          # Intelligence & framework sync tool

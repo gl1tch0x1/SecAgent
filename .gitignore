@@ -23,7 +23,6 @@ frontend/apex/.next/
 
 # Scan artifacts
 cog-ai-results/
-/benchmark-results/
 
 # IDE
 .vscode/

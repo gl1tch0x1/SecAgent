@@ -8,7 +8,8 @@ import httpx
 
 from secagents.agents.base import BaseAgent, AgentConfig, AgentOutput, AgentRole
 from secagents.prompts import RECON_PROMPT
-from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.infra.scope import enforce_scope, ScopeViolationError, normalize_target
+from secagents.infra.execution_budget import ExecutionBudget
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,11 @@ class ReconAgent(BaseAgent):
             )
         )
         self.logger = logging.getLogger("secagents.recon")
+        self.budget = ExecutionBudget(max_requests=100, max_duration_seconds=60)
+
+    async def _get(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
+        async with self.budget.request(url):
+            return await client.get(url)
 
     def base_system_prompt(self) -> str:
         """Return the recon agent's system prompt."""
@@ -55,6 +61,8 @@ class ReconAgent(BaseAgent):
         self.logger.info(f"Starting {action} on {target}")
 
         try:
+            enforce_scope(target)
+            self.budget = ExecutionBudget(max_requests=100, max_duration_seconds=60)
             if action == "subdomain_enum":
                 results = await self._subdomain_enum(target)
             elif action == "http_probe":
@@ -143,24 +151,32 @@ class ReconAgent(BaseAgent):
         prefixes = ["api", "admin", "staging", "dev", "www", "app", "portal", "mail", "v1", "test"]
         findings = []
 
-        clean_target = target.replace("https://", "").replace("http://", "").split("/")[0]
+        clean_target = normalize_target(target)
 
         async def _check_sub(prefix: str):
             sub = f"{prefix}.{clean_target}"
             url = f"https://{sub}"
+            try:
+                enforce_scope(url)
+            except ScopeViolationError:
+                return None
             from secagents.core.native import native_engine
 
             # Fast C++ socket probe before full HTTP request
-            probe_res = native_engine.probe_port(sub, 443, timeout_ms=1000)
+            async with self.budget.request(url):
+                probe_res = native_engine.probe_port(sub, 443, timeout_ms=1000)
             if not probe_res.get("open", False):
-                probe_res = native_engine.probe_port(sub, 80, timeout_ms=1000)
+                async with self.budget.request(f"http://{sub}"):
+                    probe_res = native_engine.probe_port(sub, 80, timeout_ms=1000)
                 if not probe_res.get("open", False):
                     return None
 
             verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
             try:
-                async with httpx.AsyncClient(timeout=3.0, verify=verify_ssl) as client:
-                    resp = await client.get(url)
+                async with httpx.AsyncClient(
+                    timeout=3.0, verify=verify_ssl, follow_redirects=False
+                ) as client:
+                    resp = await self._get(client, url)
                     return {
                         "type": "subdomain",
                         "value": sub,
@@ -207,16 +223,16 @@ class ReconAgent(BaseAgent):
         """Probe target host for active HTTP/HTTPS services."""
         self.logger.info(f"Probing HTTP services for {target}")
         findings = []
-        clean_target = target.replace("https://", "").replace("http://", "").rstrip("/")
+        clean_target = normalize_target(target)
         verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
 
         for scheme in ["https", "http"]:
             url = f"{scheme}://{clean_target}"
             try:
                 async with httpx.AsyncClient(
-                    timeout=4.0, verify=verify_ssl, follow_redirects=True
+                    timeout=4.0, verify=verify_ssl, follow_redirects=False
                 ) as client:
-                    resp = await client.get(url)
+                    resp = await self._get(client, url)
                     server_header = resp.headers.get("server", "Unknown")
                     title_match = re.search(r"<title>(.*?)</title>", resp.text, re.IGNORECASE)
                     page_title = title_match.group(1).strip() if title_match else "No Title"
@@ -251,9 +267,9 @@ class ReconAgent(BaseAgent):
 
         try:
             async with httpx.AsyncClient(
-                timeout=5.0, verify=verify_ssl, follow_redirects=True
+                timeout=5.0, verify=verify_ssl, follow_redirects=False
             ) as client:
-                resp = await client.get(base_url)
+                resp = await self._get(client, base_url)
                 if resp.status_code == 200:
                     # Extract links from href attributes
                     links = set(re.findall(r'href=["\'](/[^"\']+)["\']', resp.text))
@@ -288,8 +304,10 @@ class ReconAgent(BaseAgent):
         verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
 
         try:
-            async with httpx.AsyncClient(timeout=4.0, verify=verify_ssl) as client:
-                resp = await client.get(base_url)
+            async with httpx.AsyncClient(
+                timeout=4.0, verify=verify_ssl, follow_redirects=False
+            ) as client:
+                resp = await self._get(client, base_url)
                 # Find input names from HTML form fields
                 inputs = set(
                     re.findall(r'<input[^>]+name=["\']([^"\']+)["\']', resp.text, re.IGNORECASE)

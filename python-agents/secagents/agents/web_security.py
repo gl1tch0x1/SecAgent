@@ -3,12 +3,12 @@
 import asyncio
 import logging
 import os
-import time
 from typing import Optional
 
 import httpx
 from secagents.agents.base import BaseAgent, AgentConfig, AgentOutput, AgentRole
 from secagents.prompts import WEB_SECURITY_PROMPT
+from secagents.infra.execution_budget import ExecutionBudget
 from secagents.infra.scope import enforce_scope, ScopeViolationError
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ class WebSecurityAgent(BaseAgent):
     - Generate context-aware payloads
     - Test multiple vulnerability types
     - Validate findings with response analysis
-    - Minimize false positives using linear-scaling time-based verification
+    - Record signature matches as manual leads pending typed proof
     """
 
     # Vulnerability detection signatures - Enhanced with 20+ classes
@@ -198,6 +198,7 @@ class WebSecurityAgent(BaseAgent):
         )
         self.logger = logging.getLogger("secagents.web_security")
         self._client: Optional[httpx.AsyncClient] = None
+        self.budget = ExecutionBudget(max_requests=100, max_duration_seconds=120)
 
     def mutate_payload_for_waf(self, payload: str, vuln_type: str) -> list[str]:
         """Generate WAF evasion payload variants via encoding, comment injection, and obfuscation."""
@@ -245,8 +246,9 @@ class WebSecurityAgent(BaseAgent):
     async def execute(self, task: dict) -> AgentOutput:
         """Execute web vulnerability scanning."""
         target = task.get("target", "")
-        endpoints = task.get("endpoints", [])
-        vuln_types = task.get("vuln_types", list(self.VULN_SIGNATURES.keys()))
+        endpoints = task.get("endpoints", [])[:20]
+        vuln_types = task.get("vuln_types", list(self.VULN_SIGNATURES.keys()))[:5]
+        self.budget = ExecutionBudget(max_requests=100, max_duration_seconds=120)
 
         if not endpoints:
             self.logger.error("No endpoints specified")
@@ -271,7 +273,8 @@ class WebSecurityAgent(BaseAgent):
                 "findings": findings,
                 "endpoints_tested": len(endpoints),
                 "vuln_types_tested": len(vuln_types),
-                "total_payloads_sent": len(endpoints) * len(vuln_types),
+                "total_requests_sent": self.budget.snapshot()["requests_used"],
+                "budget": self.budget.snapshot(),
             }
 
             self.logger.info(f"Found {len(findings)} potential vulnerabilities")
@@ -342,65 +345,26 @@ class WebSecurityAgent(BaseAgent):
             baseline = await self._send_payload(endpoint, "safe_canary_value", target)
             for payload in sig.get("payloads", []):
                 response = await self._send_payload(endpoint, payload, target)
-                if response and self._check_response(response, sig.get("patterns", [])):
-                    # Compute dynamic confidence based on baseline divergence
-                    conf = 0.7
-                    if baseline and not self._check_response(baseline, sig.get("patterns", [])):
-                        conf += 0.2
-                    if len(response) != len(baseline or ""):
-                        conf += 0.05
-                    conf = min(round(conf, 2), 0.95)
-
+                if (
+                    response
+                    and baseline is not None
+                    and not self._check_response(baseline, sig.get("patterns", []))
+                    and self._check_response(response, sig.get("patterns", []))
+                ):
                     return {
                         "type": vuln_type,
                         "endpoint": endpoint,
                         "payload": payload,
-                        "poc_url": f"{target}{endpoint}?param={payload}",
-                        "confidence": conf,
+                        "validation_status": "manual_lead",
+                        "validated": False,
+                        "confidence": 0.5,
                         "severity": self._get_severity(vuln_type),
                         "cwe": self._get_cwe(vuln_type),
                         "method": "content-based",
                     }
 
-        # 2. Time-based testing (Linear Scaling)
-        if vuln_type in self.TIME_BASED_PAYLOADS:
-            time_finding = await self._test_time_based(endpoint, vuln_type, target)
-            if time_finding:
-                return time_finding
+        # Standalone timing heuristics lack independent controls and typed proof.
 
-        return None
-
-    async def _test_time_based(self, endpoint: str, vuln_type: str, target: str) -> Optional[dict]:
-        """Linear-scaling time-based verification."""
-        payloads = self.TIME_BASED_PAYLOADS[vuln_type]
-        delays = [2, 5]
-
-        for base_payload in payloads:
-            is_vulnerable = True
-            latencies = []
-
-            for delay in delays:
-                payload = base_payload.format(delay=delay)
-                start_time = time.time()
-                await self._send_payload(endpoint, payload, target)
-                latency = time.time() - start_time
-                latencies.append(latency)
-
-                if latency < delay:
-                    is_vulnerable = False
-                    break
-
-            if is_vulnerable and latencies[1] > latencies[0]:
-                return {
-                    "type": vuln_type,
-                    "endpoint": endpoint,
-                    "payload": base_payload.format(delay=delays[1]),
-                    "confidence": 0.95,
-                    "severity": self._get_severity(vuln_type),
-                    "cwe": self._get_cwe(vuln_type),
-                    "method": "time-based-linear",
-                    "latencies": latencies,
-                }
         return None
 
     async def _send_payload(self, endpoint: str, payload: str, target: str) -> Optional[str]:
@@ -408,7 +372,8 @@ class WebSecurityAgent(BaseAgent):
         try:
             url = f"{target.rstrip('/')}/{endpoint.lstrip('/')}"
             params = {"test": payload, "q": payload}
-            resp = await self.client.get(url, params=params)
+            async with self.budget.request(url):
+                resp = await self.client.get(url, params=params)
             return resp.text
         except Exception as e:
             self.logger.debug(f"Request failed: {str(e)}")
