@@ -95,6 +95,10 @@ def build_scan_handlers(
                 seed_urls=shared.get("endpoints", []),
                 budget=shared.get("budget"),
                 auth_headers=shared.get("auth_headers"),
+                fuzz_payloads=shared.get("fuzz_payloads", False),
+                max_payload_variants=shared.get("max_payload_variants", 6),
+                fuzz_cooldown_seconds=shared.get("fuzz_cooldown_seconds", 86400.0),
+                fuzz_memory=shared.get("fuzz_memory"),
             )
         )
         progress = await scanner.run()
@@ -123,6 +127,9 @@ def build_scan_handlers(
             "urls_truncated": progress.urls_truncated,
             "skipped_stateful_checks": progress.skipped_stateful_checks,
             "skipped_callback_checks": progress.skipped_callback_checks,
+            "fuzz_variants_generated": progress.fuzz_variants_generated,
+            "fuzz_variants_sent": progress.fuzz_variants_sent,
+            "fuzz_variants_repeated": progress.fuzz_variants_repeated,
             "external_tools": autopilot.results.get("phases", {}).get("scan", {}),
         }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from secagents.modules.external_tools import ExternalTools
 from secagents.infra.logging_system import AuditLogger, AuditCategory
 from secagents.infra.scope import enforce_scope, ScopeViolationError
 from secagents.infra.execution_budget import ExecutionBudget, BudgetExceeded
+from secagents.core.aura_memory import AuraMemoryManager
+from secagents.operational.fuzzing import payload_variants
 
 
 @dataclass
@@ -33,6 +36,10 @@ class ScanConfig:
     allow_stateful_requests: bool = False
     budget: ExecutionBudget | None = None
     auth_headers: dict[str, str] | None = None
+    fuzz_payloads: bool = False
+    max_payload_variants: int = 6
+    fuzz_cooldown_seconds: float = 86400.0
+    fuzz_memory: AuraMemoryManager | None = None
 
 
 @dataclass
@@ -44,6 +51,9 @@ class ScanProgress:
     findings: list[CheckResult] = field(default_factory=list)
     skipped_stateful_checks: int = 0
     skipped_callback_checks: int = 0
+    fuzz_variants_generated: int = 0
+    fuzz_variants_sent: int = 0
+    fuzz_variants_repeated: int = 0
     start_time: float = field(default_factory=time.time)
 
     @property
@@ -62,6 +72,10 @@ class CVEScanner:
     """5-phase exploitation pipeline inspired by TerminatorZ."""
 
     def __init__(self, config: ScanConfig):
+        if config.fuzz_payloads and config.budget is None:
+            raise ValueError("Payload fuzzing requires a shared execution budget")
+        if not 0 <= config.max_payload_variants <= 32 or config.fuzz_cooldown_seconds < 0:
+            raise ValueError("Invalid payload fuzzing limits")
         self.config = config
         self.progress = ScanProgress()
         self._logger = AuditLogger.get_instance()
@@ -212,6 +226,28 @@ class CVEScanner:
     ) -> CheckResult | None:
         """Execute a single deterministic check."""
         payloads = build_payloads(check.key, url)
+        if self.config.fuzz_payloads:
+            expanded = []
+            feedback = (
+                self.config.fuzz_memory.recall_fuzz_feedback(
+                    hashlib.sha256(url.encode()).hexdigest(), check.key
+                )
+                if self.config.fuzz_memory is not None
+                else {}
+            )
+            for payload in payloads:
+                expanded.append(payload)
+                variants = payload_variants(check.key, payload, 32)
+                variants.sort(
+                    key=lambda item: (
+                        (feedback.get(item["mutation_name"], (0, 0))[1] + 1)
+                        / (feedback.get(item["mutation_name"], (0, 0))[0] + 2)
+                    ),
+                    reverse=True,
+                )
+                expanded.extend(variants[: self.config.max_payload_variants])
+            self.progress.fuzz_variants_generated += len(expanded) - len(payloads)
+            payloads = expanded
 
         if not payloads and not check.header_only:
             self.progress.skipped_callback_checks += 1
@@ -246,6 +282,23 @@ class CVEScanner:
             if payload.get("method") == "POST" and not self.config.allow_stateful_requests:
                 self.progress.skipped_stateful_checks += 1
                 continue
+            variant_fingerprint = ""
+            memory_target = ""
+            if payload.get("mutation_name"):
+                variant_fingerprint = hashlib.sha256(
+                    f"{check.key}|{payload.get('param')}|{payload.get('value')}".encode()
+                ).hexdigest()
+                memory_target = hashlib.sha256(url.encode()).hexdigest()
+                memory = self.config.fuzz_memory
+                if memory is not None and not memory.claim_fuzz_attempt(
+                    memory_target,
+                    check.key,
+                    variant_fingerprint,
+                    retry_after_seconds=self.config.fuzz_cooldown_seconds,
+                ):
+                    self.progress.fuzz_variants_repeated += 1
+                    continue
+                payload["mutation_fingerprint"] = variant_fingerprint
             try:
                 poc_url = url
                 if payload.get("method") == "HEADER":
@@ -270,8 +323,22 @@ class CVEScanner:
                     )
                     resp = await self._request(client, "GET", poc_url)
 
+                if variant_fingerprint:
+                    self.progress.fuzz_variants_sent += 1
+
                 resp_headers = {k.lower(): v for k, v in resp.headers.items()}
                 vulnerable, proof = verify_finding(check.key, resp.text, resp_headers, payload)
+                if variant_fingerprint and self.config.fuzz_memory is not None:
+                    self.config.fuzz_memory.record_fuzz_outcome(
+                        memory_target,
+                        check.key,
+                        variant_fingerprint,
+                        "candidate" if vulnerable else "no_signal",
+                    )
+                    if not vulnerable:
+                        self.config.fuzz_memory.record_fuzz_feedback(
+                            memory_target, check.key, payload["mutation_name"], False
+                        )
 
                 if vulnerable:
                     return CheckResult(
@@ -288,8 +355,16 @@ class CVEScanner:
                         payload_spec=payload,
                     )
             except BudgetExceeded:
+                if variant_fingerprint and self.config.fuzz_memory is not None:
+                    self.config.fuzz_memory.release_fuzz_attempt(
+                        memory_target, check.key, variant_fingerprint
+                    )
                 break
             except Exception:
+                if variant_fingerprint and self.config.fuzz_memory is not None:
+                    self.config.fuzz_memory.release_fuzz_attempt(
+                        memory_target, check.key, variant_fingerprint
+                    )
                 continue
 
         return None

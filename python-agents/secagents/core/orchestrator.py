@@ -193,77 +193,100 @@ class Orchestrator:
         normalized = re.sub(r"\s+", " ", normalized).strip()
 
         keyword_rules = [
-            (Intent.AI_SAFETY, [
-                "ai safety",
-                "prompt injection",
-                "repo poisoning",
-                "assistant config",
-                "cursorrules",
-                "llm jailbreak",
-                "rag poisoning",
-                "agent compromise",
-            ]),
-            (Intent.SCAN, [
-                "bug bounty",
-                "bounty hunter",
-                "security audit",
-                "web assessment",
-                "pentest",
-                "vulnerability scan",
-                "web security",
-                "scan for vulnerabilities",
-                "check for xss",
-                "check for sqli",
-                "sql injection",
-                "xss",
-                "ssrf",
-            ]),
-            (Intent.RECON, [
-                "reconnaissance",
-                "recon",
-                "discover assets",
-                "subdomain enumeration",
-                "discover subdomains",
-                "asset discovery",
-                "enumerate hosts",
-                "enumerate endpoints",
-                "find open ports",
-                "crawl website",
-            ]),
-            (Intent.REPORT, [
-                "report",
-                "generate a report",
-                "write a summary",
-                "executive summary",
-                "final report",
-                "export findings",
-                "deliverable",
-            ]),
-            (Intent.VALIDATE, [
-                "validate",
-                "verify",
-                "confirm",
-                "poc",
-                "proof",
-                "replay",
-                "check exploitability",
-            ]),
-            (Intent.PLAN, [
-                "plan",
-                "strategy",
-                "decompose",
-                "roadmap",
-                "execution plan",
-            ]),
+            (
+                Intent.AI_SAFETY,
+                [
+                    "ai safety",
+                    "prompt injection",
+                    "repo poisoning",
+                    "assistant config",
+                    "cursorrules",
+                    "llm jailbreak",
+                    "rag poisoning",
+                    "agent compromise",
+                ],
+            ),
+            (
+                Intent.SCAN,
+                [
+                    "bug bounty",
+                    "bounty hunter",
+                    "security audit",
+                    "web assessment",
+                    "pentest",
+                    "vulnerability scan",
+                    "web security",
+                    "scan for vulnerabilities",
+                    "check for xss",
+                    "check for sqli",
+                    "sql injection",
+                    "xss",
+                    "ssrf",
+                ],
+            ),
+            (
+                Intent.RECON,
+                [
+                    "reconnaissance",
+                    "recon",
+                    "discover assets",
+                    "subdomain enumeration",
+                    "discover subdomains",
+                    "asset discovery",
+                    "enumerate hosts",
+                    "enumerate endpoints",
+                    "find open ports",
+                    "crawl website",
+                ],
+            ),
+            (
+                Intent.REPORT,
+                [
+                    "report",
+                    "generate a report",
+                    "write a summary",
+                    "executive summary",
+                    "final report",
+                    "export findings",
+                    "deliverable",
+                ],
+            ),
+            (
+                Intent.VALIDATE,
+                [
+                    "validate",
+                    "verify",
+                    "confirm",
+                    "poc",
+                    "proof",
+                    "replay",
+                    "check exploitability",
+                ],
+            ),
+            (
+                Intent.PLAN,
+                [
+                    "plan",
+                    "strategy",
+                    "decompose",
+                    "roadmap",
+                    "execution plan",
+                ],
+            ),
         ]
 
         for intent, phrases in keyword_rules:
             if any(phrase in normalized for phrase in phrases):
                 return intent
 
-        if any(word in normalized for word in ["scan", "test", "exploit", "attack", "vuln", "issue", "find"]):
+        if any(
+            word in normalized
+            for word in ["scan", "test", "exploit", "attack", "vuln", "issue", "find"]
+        ):
             return Intent.SCAN
-        if any(word in normalized for word in ["discover", "subdomain", "enumerate", "crawl", "recon"]):
+        if any(
+            word in normalized for word in ["discover", "subdomain", "enumerate", "crawl", "recon"]
+        ):
             return Intent.RECON
         if any(word in normalized for word in ["report", "summary", "deliverable", "export"]):
             return Intent.REPORT

@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
+import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -171,6 +172,55 @@ def build_parser() -> argparse.ArgumentParser:
         "--setup-local-llm", action="store_true", help="Auto-provision local Ollama model"
     )
     scan.add_argument("--results-dir", default="cog-ai-results", help="Breach report directory")
+    scan.add_argument(
+        "--fuzz-payloads", action="store_true", help="Try bounded encoded GET payload variants"
+    )
+    scan.add_argument(
+        "--max-payload-variants",
+        type=int,
+        default=6,
+        help="Variants per supported base payload (0-32)",
+    )
+    scan.add_argument(
+        "--fuzz-cooldown-hours",
+        type=float,
+        default=24.0,
+        help="Avoid repeating attempted variants for this many hours",
+    )
+
+    fuzz = sub.add_parser("fuzz", help="Fuzz local binary inputs or preview HTTP payload variants")
+    fuzz_modes = fuzz.add_subparsers(dest="fuzz_mode", required=True)
+    binary = fuzz_modes.add_parser("binary", help="Mutate a binary input file and compare outcomes")
+    binary.add_argument("seed", help="Input file to mutate; the program itself is never modified")
+    binary.add_argument("--program", help="Optional local parser or executable to test")
+    binary.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        help="Program argument; {input} is replaced with the mutated file path",
+    )
+    binary.add_argument(
+        "--allow-host-execution",
+        action="store_true",
+        help="Explicitly allow running the selected program on this host",
+    )
+    binary.add_argument("--runs", type=int, default=128, help="Maximum distinct mutations (1-5000)")
+    binary.add_argument("--timeout", type=float, default=2.0, help="Seconds per program execution")
+    binary.add_argument("--max-duration", type=float, default=300.0, help="Total fuzzing seconds")
+    binary.add_argument("--max-input-bytes", type=int, default=1_048_576)
+    binary.add_argument("--max-output-bytes", type=int, default=65_536)
+    binary.add_argument("--max-saved-cases", type=int, default=20)
+    binary.add_argument(
+        "--mutation-seed", type=int, default=0, help="Reproducible mutation sequence seed"
+    )
+    binary.add_argument("--retry-after-hours", type=float, default=24.0)
+    binary.add_argument("--results-dir", default="cog-ai-results/fuzz")
+    payload = fuzz_modes.add_parser(
+        "payload", help="Preview bounded variants for a supported check"
+    )
+    payload.add_argument("check", choices=["sqli", "xss", "ssti", "lfi"])
+    payload.add_argument("seed", help="Base payload string")
+    payload.add_argument("--max-variants", type=int, default=6)
 
     # Vault Command
     vault = sub.add_parser("vault", help="Interface with secret storage and API keys")
@@ -277,25 +327,32 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     )
     console.print(f"[dim]Parameters: depth={args.depth}, workers={args.workers}[/dim]\n")
 
-    pipeline = ScanPipeline(
-        target=args.target,
-        depth=args.depth,
-        workers=args.workers,
-        use_sandbox=False,
-        skip_os_check=args.skip_os_check,
-        setup_local_llm=args.setup_local_llm,
-        results_dir=Path(args.results_dir),
-        arsenal_secondary=not args.no_arsenal,
-        max_requests=args.max_requests,
-        requests_per_second_per_host=args.rate_limit,
-        max_duration_seconds=args.max_duration,
-        auth_headers=auth_headers,
-        api_spec_path=Path(args.api_spec) if args.api_spec else None,
-        har_paths=[Path(path) for path in args.har],
-        identity_contract_path=Path(args.identity_contract) if args.identity_contract else None,
-        state_contract_path=Path(args.state_contract) if args.state_contract else None,
-        ssrf_contract_path=Path(args.ssrf_contract) if args.ssrf_contract else None,
-    )
+    try:
+        pipeline = ScanPipeline(
+            target=args.target,
+            depth=args.depth,
+            workers=args.workers,
+            use_sandbox=False,
+            skip_os_check=args.skip_os_check,
+            setup_local_llm=args.setup_local_llm,
+            results_dir=Path(args.results_dir),
+            arsenal_secondary=not args.no_arsenal,
+            max_requests=args.max_requests,
+            requests_per_second_per_host=args.rate_limit,
+            max_duration_seconds=args.max_duration,
+            auth_headers=auth_headers,
+            api_spec_path=Path(args.api_spec) if args.api_spec else None,
+            har_paths=[Path(path) for path in args.har],
+            identity_contract_path=Path(args.identity_contract) if args.identity_contract else None,
+            state_contract_path=Path(args.state_contract) if args.state_contract else None,
+            ssrf_contract_path=Path(args.ssrf_contract) if args.ssrf_contract else None,
+            fuzz_payloads=args.fuzz_payloads,
+            max_payload_variants=args.max_payload_variants,
+            fuzz_cooldown_seconds=args.fuzz_cooldown_hours * 3600,
+        )
+    except ValueError as exc:
+        console.print(f"[error]Scan configuration error:[/error] {exc}")
+        return 2
 
     try:
         with Progress(
@@ -391,6 +448,50 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         )
         else 0
     )
+
+
+def cmd_fuzz(args: argparse.Namespace) -> int:
+    from secagents.operational.fuzzing import BinaryFuzzConfig, payload_variants, run_binary_fuzz
+
+    try:
+        if args.fuzz_mode == "payload":
+            variants = payload_variants(
+                args.check,
+                {"method": "GET", "param": "q", "value": args.seed},
+                args.max_variants,
+            )
+            console.print(json.dumps(variants, indent=2), markup=False)
+            return 0
+        from secagents.core.aura_memory import AuraMemoryManager
+
+        results_dir = Path(args.results_dir)
+        config = BinaryFuzzConfig(
+            seed_path=Path(args.seed),
+            results_dir=results_dir,
+            program=Path(args.program) if args.program else None,
+            program_args=tuple(args.arg),
+            allow_host_execution=args.allow_host_execution,
+            runs=args.runs,
+            timeout_seconds=args.timeout,
+            max_duration_seconds=args.max_duration,
+            max_input_bytes=args.max_input_bytes,
+            max_output_bytes=args.max_output_bytes,
+            max_saved_cases=args.max_saved_cases,
+            mutation_seed=args.mutation_seed,
+            retry_after_seconds=args.retry_after_hours * 3600,
+        )
+        memory = AuraMemoryManager(db_path=results_dir / "aura-fuzz.db")
+        report = run_binary_fuzz(config, memory)
+        console.print(
+            json.dumps(
+                {"summary": report["summary"], "report_path": report["report_path"]}, indent=2
+            ),
+            markup=False,
+        )
+        return 0
+    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        console.print(f"[error]Fuzzing configuration or execution failed:[/error] {exc}")
+        return 2
 
 
 async def cmd_vault(args: argparse.Namespace) -> int:
@@ -497,6 +598,10 @@ def main() -> None:
     _load_env()
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.command == "fuzz":
+        configure_logging(args.log_level, args.json_output)
+        sys.exit(cmd_fuzz(args))
 
     try:
         runtime = load_runtime_config(args)

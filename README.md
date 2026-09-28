@@ -100,6 +100,7 @@ Built for:
 |  **Headless Browser Engine** | `BrowserAgent`, Playwright | Chromium DOM tree inspection, dynamic JS error tracking, and automated HTML form input extraction. |
 |  **Web Security Scanner** | `CVEScanner`, `CVEChecks` | Check catalog with typed policies; unsupported or capability-dependent checks remain manual leads or coverage gaps. |
 |  **API Inventory** | OpenAPI, Swagger, HAR | Preserves methods and bodies in memory; default active probes use GET templates only. Stateful writes require an explicit contract. |
+|  **Bounded Fuzzing** | Binary input mutator, GET payload variants, AURA feedback | Mutates local input files, records byte and bit changes plus program outcomes, and optionally tests encoded GET variants under the shared scan budget and proof policy. |
 |  **12 Specialized Swarm Agents** | `specialized.py` | Functional AI swarm agents for intelligent tool selection, CTF challenge solving, exploit generation, vulnerability correlation, and rate-limit detection. |
 |  **Web3 & Contract Auditor** | `Web3SecurityAgent` | EVM & Solana smart contract security analysis for reentrancy, integer overflow, delegatecall vulnerabilities, and access control bypasses. |
 |  **PoC Verification** | `CrucibleValidator` | Typed replay, controls, and evidence hashes for supported checks. This reduces unproven findings but does not establish a zero false-positive rate. |
@@ -529,9 +530,42 @@ Options:
   --har PATH              Import captured request templates from a HAR file
   --setup-local-llm       Auto-provision local Ollama model
   --results-dir PATH      Output directory for deliverables (default: cog-ai-results)
+  --fuzz-payloads         Try bounded, check-specific GET payload variants
+  --max-payload-variants N  Variants per base payload (default: 6; max: 32)
+  --fuzz-cooldown-hours N   Suppress repeated variants for this many hours (default: 24)
 ```
 
 The bounded default scan meters built-in HTTP requests and configured Shodan/Chaos provider requests. Optional external binaries remain disabled because their internal traffic cannot be metered by this budget. Browser discovery and XSS proof require Playwright and Chromium. The scan handlers run on the host; use an operator-managed container or virtual machine when runtime isolation is required. Reports record consumed budget, termination reason, findings, manual leads, and coverage gaps.
+
+### Bounded fuzzing
+
+Preview check-specific HTTP variants without sending traffic:
+
+```bash
+secagent fuzz payload sqli "1 OR 1=1--" --max-variants 6
+```
+
+Include these variants in an authorized scan:
+
+```bash
+secagent scan --target https://app.example --fuzz-payloads --max-payload-variants 6
+```
+
+Only SQL injection, XSS, SSTI and path traversal GET payloads currently have mutation recipes. Variants include selected case, whitespace, path, entity and percent-encoding forms, plus bounded pairs of these transformations. They use the same scope checks, request budget, and typed proof requirements as base checks; a string match alone does not create a validated finding. AURA stores hashed attempt fingerprints and aggregate operator outcomes, skips recently attempted variants, and retries them after the configured cooldown. It does not autonomously repair code or guarantee every possible encoding or bypass.
+
+Mutate a local binary input file and inspect exact input bit positions:
+
+```bash
+secagent fuzz binary ./sample.bin --runs 128
+```
+
+To compare a parser's exit status and output bytes, explicitly opt into running that local program. It receives the mutated file path as its final argument unless `--arg "{input}"` places the path elsewhere:
+
+```bash
+secagent fuzz binary ./sample.bin --program ./parser --allow-host-execution --runs 128
+```
+
+The binary command never modifies the program. It writes a JSON report and a bounded set of interesting mutated inputs to `cog-ai-results/fuzz/`. Reports include seed/program hashes, mutation operator and offset, changed input byte and bit positions, bounded stdout/stderr hashes and bit differences, exit status, timeouts, repeat counts and termination reason. Insertions and deletions shift subsequent positional offsets. Treat reports and saved cases as sensitive because byte differences can expose input or output content. Program execution is **on the host**, with per-run and total deadlines but without process or network isolation; run untrusted programs inside an operator-managed VM or container. Output comparison retains only the configured prefix, and crashes or changed output are triage signals rather than proven vulnerabilities.
 
 ### Opt-in proof contracts
 

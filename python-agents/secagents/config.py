@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
 
 from secagents.infra.security_policy import SecurityPolicy
 
@@ -72,19 +71,18 @@ def _parse_allowed_domains(raw: str | None) -> list[str]:
 
 
 def build_scan_config(args: object | None = None, env: dict[str, str] | None = None) -> ScanConfig:
-    env = env or os.environ
+    if env is None:
+        env = dict(os.environ)
     if args is not None:
         target = getattr(args, "target", env.get("SECAGENT_TARGET", ""))
         depth = getattr(args, "depth", env.get("SECAGENT_DEPTH", "standard"))
         workers = int(getattr(args, "workers", env.get("SECAGENT_WORKERS", "4")))
         max_requests = int(getattr(args, "max_requests", env.get("SECAGENT_MAX_REQUESTS", "1000")))
-        rps = float(
-            getattr(args, "rate_limit", env.get("SECAGENT_RATE_LIMIT", "5.0"))
+        rps = float(getattr(args, "rate_limit", env.get("SECAGENT_RATE_LIMIT", "5.0")))
+        max_duration = float(getattr(args, "max_duration", env.get("SECAGENT_MAX_DURATION", "900")))
+        results_dir = getattr(
+            args, "results_dir", env.get("SECAGENT_RESULTS_DIR", "cog-ai-results")
         )
-        max_duration = float(
-            getattr(args, "max_duration", env.get("SECAGENT_MAX_DURATION", "900"))
-        )
-        results_dir = getattr(args, "results_dir", env.get("SECAGENT_RESULTS_DIR", "cog-ai-results"))
         verify_ssl = _normalize_bool(
             getattr(args, "insecure", None),
             default=not _normalize_bool(env.get("SECAGENT_VERIFY_SSL", "true"), default=True),
@@ -111,7 +109,9 @@ def build_scan_config(args: object | None = None, env: dict[str, str] | None = N
         requests_per_second_per_host=rps,
         max_duration_seconds=max_duration,
         check_ssl=check_ssl and verify_ssl,
-        use_sandbox=not _normalize_bool(env.get("SECAGENT_DISABLE_SANDBOX", "false"), default=False),
+        use_sandbox=not _normalize_bool(
+            env.get("SECAGENT_DISABLE_SANDBOX", "false"), default=False
+        ),
         results_dir=results_dir,
         allowed_domains=allowed,
         blocked_domains=blocked,
@@ -119,7 +119,8 @@ def build_scan_config(args: object | None = None, env: dict[str, str] | None = N
 
 
 def load_runtime_config(args: object | None = None, env: dict[str, str] | None = None) -> AppConfig:
-    env = env or os.environ
+    if env is None:
+        env = dict(os.environ)
     policy = SecurityPolicy.from_env(env)
     scan_cfg = build_scan_config(args, env)
     target = getattr(args, "target", None) if args is not None else env.get("SECAGENT_TARGET", "")
@@ -129,7 +130,11 @@ def load_runtime_config(args: object | None = None, env: dict[str, str] | None =
     if not target:
         raise ValueError("A target is required to start a scan")
 
-    log_level = getattr(args, "log_level", env.get("SECAGENT_LOG_LEVEL", "INFO")) if args else env.get("SECAGENT_LOG_LEVEL", "INFO")
+    log_level = (
+        getattr(args, "log_level", env.get("SECAGENT_LOG_LEVEL", "INFO"))
+        if args
+        else env.get("SECAGENT_LOG_LEVEL", "INFO")
+    )
     json_output = bool(
         getattr(args, "json_output", False)
         if args is not None

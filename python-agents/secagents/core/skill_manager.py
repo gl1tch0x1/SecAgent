@@ -95,7 +95,9 @@ class SkillManager:
 
             message = f"Running the {skill_name} workflow in the SecAgents system to {action}"
             async with httpx.AsyncClient(timeout=0.5) as client:
-                response = await client.post("http://localhost:8888/notify", json={"message": message})
+                response = await client.post(
+                    "http://localhost:8888/notify", json={"message": message}
+                )
                 response.raise_for_status()
         except Exception as exc:
             logger.warning(

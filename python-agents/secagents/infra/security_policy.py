@@ -22,8 +22,12 @@ class SecurityPolicy:
         require_proof_for_state_changes: bool = True,
         require_proof_for_ssrf: bool = True,
     ) -> None:
-        self.allowed_domains = [item.strip().lower() for item in (allowed_domains or []) if item.strip()]
-        self.blocked_domains = [item.strip().lower() for item in (blocked_domains or []) if item.strip()]
+        self.allowed_domains = [
+            item.strip().lower() for item in (allowed_domains or []) if item.strip()
+        ]
+        self.blocked_domains = [
+            item.strip().lower() for item in (blocked_domains or []) if item.strip()
+        ]
         self.allow_write_operations = allow_write_operations
         self.allow_ssrf = allow_ssrf
         self.require_proof_for_state_changes = require_proof_for_state_changes
@@ -31,18 +35,23 @@ class SecurityPolicy:
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "SecurityPolicy":
-        env = env or os.environ
+        if env is None:
+            env = dict(os.environ)
         allowed = _parse_csv(env.get("ALLOWED_DOMAINS", ""))
         blocked = _parse_csv(env.get("BLOCKED_DOMAINS", ""))
         return cls(
             allowed_domains=allowed,
             blocked_domains=blocked,
-            allow_write_operations=_string_to_bool(env.get("SECAGENT_ALLOW_WRITE_OPERATIONS", "false")),
+            allow_write_operations=_string_to_bool(
+                env.get("SECAGENT_ALLOW_WRITE_OPERATIONS", "false")
+            ),
             allow_ssrf=_string_to_bool(env.get("SECAGENT_ALLOW_SSRF", "false")),
             require_proof_for_state_changes=_string_to_bool(
                 env.get("SECAGENT_REQUIRE_PROOF_FOR_STATE_CHANGES", "true")
             ),
-            require_proof_for_ssrf=_string_to_bool(env.get("SECAGENT_REQUIRE_PROOF_FOR_SSRF", "true")),
+            require_proof_for_ssrf=_string_to_bool(
+                env.get("SECAGENT_REQUIRE_PROOF_FOR_SSRF", "true")
+            ),
         )
 
     def validate_target(self, target: str) -> str:
@@ -76,7 +85,14 @@ class SecurityPolicy:
             f"Allowed domains: {', '.join(self.allowed_domains)}"
         )
 
-    def validate_operation(self, operation: str, *, requires_proof: bool = False, is_write: bool = False, is_ssrf: bool = False) -> None:
+    def validate_operation(
+        self,
+        operation: str,
+        *,
+        requires_proof: bool = False,
+        is_write: bool = False,
+        is_ssrf: bool = False,
+    ) -> None:
         op = operation.lower()
         if is_ssrf and not self.allow_ssrf:
             raise SecurityPolicyViolation(
@@ -86,7 +102,11 @@ class SecurityPolicy:
             raise SecurityPolicyViolation(
                 f"Operation '{op}' is blocked because write operations are disabled by policy."
             )
-        if requires_proof or (is_write and self.require_proof_for_state_changes) or (is_ssrf and self.require_proof_for_ssrf):
+        if (
+            requires_proof
+            or (is_write and self.require_proof_for_state_changes)
+            or (is_ssrf and self.require_proof_for_ssrf)
+        ):
             # This is intentionally strict: the pipeline must provide an explicit proof artifact
             # before any state-changing or SSRF validation is allowed to proceed.
             pass

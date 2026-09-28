@@ -20,6 +20,7 @@ def configure_logging(level: str = "INFO", json_output: bool = False) -> logging
             logger.removeHandler(handler)
 
     handler = logging.StreamHandler()
+    formatter: logging.Formatter
     if json_output:
         formatter = JsonFormatter()
     else:
@@ -76,5 +77,8 @@ class MetricsCollector:
     def snapshot(self) -> dict[str, Any]:
         return {
             "counters": dict(self._counters),
-            "timings": {key: {"count": len(values), "avg_ms": sum(values) / len(values) if values else 0.0} for key, values in self._timings.items()},
+            "timings": {
+                key: {"count": len(values), "avg_ms": sum(values) / len(values) if values else 0.0}
+                for key, values in self._timings.items()
+            },
         }

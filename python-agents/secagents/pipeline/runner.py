@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 from rich.console import Console
 
@@ -27,6 +28,7 @@ from secagents.intel.chaos_client import ChaosIntel
 from secagents.crucible.identity_proof import load_identity_contracts, prove_identity
 from secagents.crucible.state_contract import load_state_contracts, observe_state_contract
 from secagents.crucible.oast_proof import load_ssrf_contracts, prove_ssrf
+from secagents.core.aura_memory import AuraMemoryManager
 
 
 class ScanPipeline:
@@ -51,6 +53,9 @@ class ScanPipeline:
         identity_contract_path: Path | None = None,
         state_contract_path: Path | None = None,
         ssrf_contract_path: Path | None = None,
+        fuzz_payloads: bool = False,
+        max_payload_variants: int = 6,
+        fuzz_cooldown_seconds: float = 86400.0,
     ):
         self.target = target
         self.depth = depth
@@ -66,6 +71,11 @@ class ScanPipeline:
         self.identity_contract_path = identity_contract_path
         self.state_contract_path = state_contract_path
         self.ssrf_contract_path = ssrf_contract_path
+        if not 0 <= max_payload_variants <= 32 or fuzz_cooldown_seconds < 0:
+            raise ValueError("Invalid payload fuzzing limits")
+        self.fuzz_payloads = fuzz_payloads
+        self.max_payload_variants = max_payload_variants
+        self.fuzz_cooldown_seconds = fuzz_cooldown_seconds
         self.budget = ExecutionBudget(
             max_requests=max_requests,
             requests_per_second_per_host=requests_per_second_per_host,
@@ -184,6 +194,10 @@ class ScanPipeline:
             "request_templates": templates,
             "budget": self.budget,
             "auth_headers": self.auth_headers,
+            "fuzz_payloads": self.fuzz_payloads,
+            "max_payload_variants": self.max_payload_variants,
+            "fuzz_cooldown_seconds": self.fuzz_cooldown_seconds,
+            "fuzz_memory": AuraMemoryManager.get_instance() if self.fuzz_payloads else None,
         }
         armada = ArmadaOrchestrator(workers=self.workers)
         for name, handler in build_scan_handlers(shared).items():
@@ -341,6 +355,26 @@ class ScanPipeline:
                     if item.get("check_key") == "ssrf"
                 ),
             }
+            if self.fuzz_payloads and shared["fuzz_memory"] is not None:
+                for outcome in outcomes:
+                    payload_spec = outcome.get("payload_spec") or {}
+                    fingerprint = payload_spec.get("mutation_fingerprint")
+                    mutation_name = payload_spec.get("mutation_name")
+                    url = outcome.get("url")
+                    check_key = outcome.get("check_key")
+                    status = outcome.get("validation_status")
+                    if not all((fingerprint, mutation_name, url, check_key)) or status not in {
+                        "validated",
+                        "rejected",
+                    }:
+                        continue
+                    target_key = hashlib.sha256(str(url).encode()).hexdigest()
+                    shared["fuzz_memory"].record_fuzz_outcome(
+                        target_key, check_key, fingerprint, status
+                    )
+                    shared["fuzz_memory"].record_fuzz_feedback(
+                        target_key, check_key, mutation_name, status == "validated"
+                    )
             validated = [f for f in outcomes if f.get("validated")]
             self.results["findings"] = validated
             self.results["manual_leads"] = [
@@ -358,7 +392,7 @@ class ScanPipeline:
             registry.register(f)
 
         # 6b. Crystallize Cognitive Memory Signals
-        from secagents.core.aura_memory import AuraMemoryManager, TargetDNA
+        from secagents.core.aura_memory import TargetDNA
 
         memory = AuraMemoryManager.get_instance()
 
@@ -419,6 +453,29 @@ class ScanPipeline:
                     for v in armada_results.get("tasks", {}).values()
                     if isinstance(v, dict)
                 ),
+                "payload_fuzzing": {
+                    "enabled": self.fuzz_payloads,
+                    "variants_generated": sum(
+                        v.get("fuzz_variants_generated", 0)
+                        for v in armada_results.get("tasks", {}).values()
+                        if isinstance(v, dict)
+                    ),
+                    "variants_sent": sum(
+                        v.get("fuzz_variants_sent", 0)
+                        for v in armada_results.get("tasks", {}).values()
+                        if isinstance(v, dict)
+                    ),
+                    "repeats_skipped": sum(
+                        v.get("fuzz_variants_repeated", 0)
+                        for v in armada_results.get("tasks", {}).values()
+                        if isinstance(v, dict)
+                    ),
+                    "variants_validated": sum(
+                        bool(item.get("validated"))
+                        for item in outcomes
+                        if (item.get("payload_spec") or {}).get("mutation_fingerprint")
+                    ),
+                },
                 "budget": self.results["budget"],
                 "api_inventory": self.results["phases"]["api_inventory"],
                 "browser_discovery": self.results["phases"]["browser_discovery"],

@@ -106,6 +106,57 @@ async def test_scanner_replaces_existing_query_parameter(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_opt_in_payload_fuzzing_stays_bounded_and_skips_prior_variants(
+    monkeypatch, tmp_path
+):
+    from secagents.core.aura_memory import AuraMemoryManager
+
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    seen = []
+
+    def respond(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, text="ordinary response")
+
+    memory = AuraMemoryManager(db_path=tmp_path / "aura.db")
+    budget = ExecutionBudget(max_requests=12, requests_per_second_per_host=1000)
+    scanner = CVEScanner(
+        ScanConfig(
+            target="example.com",
+            budget=budget,
+            fuzz_payloads=True,
+            max_payload_variants=2,
+            fuzz_memory=memory,
+        )
+    )
+    check = next(check for check in CHECKS if check.key == "sqli")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        assert (
+            await scanner._run_check(client, "https://example.com/search", check)
+            is None
+        )
+        first_count = len(seen)
+        assert (
+            await scanner._run_check(client, "https://example.com/search", check)
+            is None
+        )
+    assert first_count == 6
+    assert len(seen) == 4 + scanner.progress.fuzz_variants_sent
+    assert scanner.progress.fuzz_variants_generated == 8
+    assert scanner.progress.fuzz_variants_repeated >= 1
+    assert (
+        scanner.progress.fuzz_variants_sent + scanner.progress.fuzz_variants_repeated
+        == scanner.progress.fuzz_variants_generated
+    )
+    assert budget.snapshot()["requests_used"] == len(seen)
+
+
+def test_payload_fuzzing_requires_a_shared_budget():
+    with pytest.raises(ValueError, match="shared execution budget"):
+        CVEScanner(ScanConfig(target="example.com", fuzz_payloads=True))
+
+
+@pytest.mark.asyncio
 async def test_active_proof_needs_negative_control_and_two_replays(monkeypatch):
     monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
     seen = []
@@ -156,14 +207,16 @@ async def test_active_negative_control_keeps_authentication(monkeypatch):
     await validator.aclose()
     validator._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     try:
-        outcome = await validator.validate_finding({
-            "url": "https://example.com/search",
-            "poc_url": "https://example.com/search?q=1%27",
-            "check_key": "sqli",
-            "request_method": "GET",
-            "request_headers": {"X-Scan-Session": "fixture-session"},
-            "payload_spec": {"method": "GET", "param": "q", "value": "1'"},
-        })
+        outcome = await validator.validate_finding(
+            {
+                "url": "https://example.com/search",
+                "poc_url": "https://example.com/search?q=1%27",
+                "check_key": "sqli",
+                "request_method": "GET",
+                "request_headers": {"X-Scan-Session": "fixture-session"},
+                "payload_spec": {"method": "GET", "param": "q", "value": "1'"},
+            }
+        )
         assert outcome["validated"] is True
         assert seen == ["fixture-session"] * 4
         assert outcome["proof"]["control_used"] is True
