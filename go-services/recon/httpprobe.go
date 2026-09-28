@@ -2,7 +2,6 @@ package recon
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net/http"
 	"sync"
@@ -31,7 +30,6 @@ func NewHTTPProber() *HTTPProber {
 		Client: &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 				MaxIdleConns:      100,
 				DisableKeepAlives: false,
 			},
@@ -54,6 +52,10 @@ func (p *HTTPProber) Probe(ctx context.Context, hosts []string) <-chan ProbeResu
 		defer close(results)
 		defer wg.Wait()
 		for _, host := range hosts {
+			// Validate host against ALLOWED_DOMAINS before probing
+			if err := checkScope(host); err != nil {
+				continue // Skip hosts not in allowed list
+			}
 			for _, port := range p.Ports {
 				select {
 				case <-ctx.Done():

@@ -1,13 +1,13 @@
-"""Unified pipeline: Pre-flight → Vault → Armada → Crucible → Remediation → Hermes."""
+"""Unified scan pipeline: scope, discovery, scanning, proof, and reporting."""
 
 from __future__ import annotations
 
 import os
+import hashlib
 from pathlib import Path
 from rich.console import Console
 
 from secagents.operational.integrity import check_os_security_updates, OS_UPDATE_MESSAGE
-from secagents.vault.env_loader import Vault
 from secagents.whichllm.hardware import detect_hardware, setup_ollama
 from secagents.armada.swarm import ArmadaOrchestrator
 from secagents.armada.handlers import build_scan_handlers
@@ -18,17 +18,21 @@ from secagents.remediation.patcher import AutoPatcher
 from secagents.remediation.reporter import ReportGenerator
 from secagents.hermes.retrospective import RetrospectiveAgent
 from secagents.hermes.store import HermesMemory
+from secagents.engine.ci_notifier import CINotifier
+from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.infra.execution_budget import ExecutionBudget
+from secagents.infra.request_inventory import import_har, import_openapi
+from secagents.infra.browser_discovery import discover_browser
 from secagents.intel.shodan_client import ShodanIntel
 from secagents.intel.chaos_client import ChaosIntel
-from secagents.fortress.sandbox import FortressSandbox
-from secagents.engine.ci_notifier import CINotifier
-from secagents.llm.omni import OmniLLM
-from secagents.llm.consensus import ConsensusEngine
-from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.crucible.identity_proof import load_identity_contracts, prove_identity
+from secagents.crucible.state_contract import load_state_contracts, observe_state_contract
+from secagents.crucible.oast_proof import load_ssrf_contracts, prove_ssrf
+from secagents.core.aura_memory import AuraMemoryManager
 
 
 class ScanPipeline:
-    """Production scan pipeline with scope enforcement and deterministic checks."""
+    """Bounded scan pipeline with scope enforcement and deterministic checks."""
 
     def __init__(
         self,
@@ -40,6 +44,18 @@ class ScanPipeline:
         setup_local_llm: bool = False,
         results_dir: Path | None = None,
         arsenal_secondary: bool = True,
+        max_requests: int = 1000,
+        requests_per_second_per_host: float = 5.0,
+        max_duration_seconds: float = 900.0,
+        auth_headers: dict[str, str] | None = None,
+        api_spec_path: Path | None = None,
+        har_paths: list[Path] | None = None,
+        identity_contract_path: Path | None = None,
+        state_contract_path: Path | None = None,
+        ssrf_contract_path: Path | None = None,
+        fuzz_payloads: bool = False,
+        max_payload_variants: int = 6,
+        fuzz_cooldown_seconds: float = 86400.0,
     ):
         self.target = target
         self.depth = depth
@@ -49,6 +65,23 @@ class ScanPipeline:
         self.setup_local_llm = setup_local_llm
         self.results_dir = results_dir or Path(os.environ.get("RESULTS_DIR", "cog-ai-results"))
         self.arsenal_secondary = arsenal_secondary
+        self.auth_headers = auth_headers or {}
+        self.api_spec_path = api_spec_path
+        self.har_paths = har_paths or []
+        self.identity_contract_path = identity_contract_path
+        self.state_contract_path = state_contract_path
+        self.ssrf_contract_path = ssrf_contract_path
+        if not 0 <= max_payload_variants <= 32 or fuzz_cooldown_seconds < 0:
+            raise ValueError("Invalid payload fuzzing limits")
+        self.fuzz_payloads = fuzz_payloads
+        self.max_payload_variants = max_payload_variants
+        self.fuzz_cooldown_seconds = fuzz_cooldown_seconds
+        self.budget = ExecutionBudget(
+            max_requests=max_requests,
+            requests_per_second_per_host=requests_per_second_per_host,
+            max_concurrency=workers,
+            max_duration_seconds=max_duration_seconds,
+        )
         self.results: dict = {"target": target, "phases": {}, "findings": [], "chains": []}
         self.console = Console()
 
@@ -59,16 +92,17 @@ class ScanPipeline:
             self.results["domain"] = domain
         except ScopeViolationError as e:
             self.console.print(f"[bold red]⛔ Scope Violation:[/bold red] {e}")
-            raise SystemExit(1) from e
+            raise ScopeViolationError(str(e)) from e
 
         # 1. Pre-flight
         ok, msg = check_os_security_updates(skip=self.skip_os_check)
         if not ok:
             self.console.print(f"[bold red]CRITICAL:[/bold red] {OS_UPDATE_MESSAGE}")
-            raise SystemExit(1)
+            raise RuntimeError(OS_UPDATE_MESSAGE)
         self.results["phases"]["preflight"] = {"os_check": msg}
 
-        # 2. The Vault
+        # 2. Optional local model provisioning. Proof is deterministic and
+        # does not depend on an API key or an LLM opinion.
         from secagents.core.skill_manager import skill_manager
 
         if skill_manager.skills:
@@ -76,53 +110,73 @@ class ScanPipeline:
                 "[bold green]🔥[/bold green] [white]Advanced Hunting Skills loaded from SKILL.md[/white]"
             )
 
-        vault = Vault()
-        await vault.validate_all()
-        # vault.print_status() # CLI handles this now
-
-        if not vault.any_llm_available() and not os.environ.get("OLLAMA_HOST"):
-            self.console.print(
-                "[bold yellow]⚠️  No LLM keys validated — attempting local Ollama fallback[/bold yellow]"
-            )
-            setup_ollama(pull=self.setup_local_llm)
-
         if self.setup_local_llm:
             hw = detect_hardware()
             self.console.print(f"  [cyan]Hardware:[/cyan] {hw.summary()}")
             _, ollama_msg = setup_ollama(pull=True)
             self.console.print(f"  [cyan]whichllm:[/cyan] {ollama_msg}")
 
-        llm = OmniLLM()
-        consensus = ConsensusEngine(llm=llm, min_agreement=2 if len(llm.providers) >= 2 else 1)
-
-        # 3. Fortress sandbox
-        sandbox = None
-        if self.use_sandbox:
-            try:
-                sandbox = FortressSandbox(self.results_dir)
-                self.results["run_dir"] = str(sandbox.run_dir)
-                if not sandbox.ensure_image():
-                    self.console.print(
-                        "[yellow]⚠️  Fortress image missing — build: docker build -t secagents/sandbox:latest -f sandbox/Dockerfile sandbox/[/yellow]"
-                    )
-            except RuntimeError as e:
-                self.console.print(f"[yellow]⚠️  Fortress unavailable: {e}[/yellow]")
+        # Fortress is not an isolation boundary for the Python scan path.
+        self.results["phases"]["runtime"] = {"status": "host_execution"}
 
         # 4. External intel
         self.console.print(
             "[bold blue]󰋼[/bold blue] [white]Extracting external intelligence...[/white]"
         )
         intel: dict = {}
-        chaos = ChaosIntel()
-        shodan = ShodanIntel()
-        if chaos.available:
-            subs = await chaos.subdomains(domain)
-            intel["chaos_subdomains"] = subs[:500]
-            self.results["phases"]["chaos"] = {"count": len(subs)}
+        providers: dict[str, str] = {}
+        shodan = ShodanIntel(budget=self.budget)
+        chaos = ChaosIntel(budget=self.budget)
         if shodan.available:
-            dns_data = await shodan.search_domain(domain)
-            intel["shodan"] = dns_data
-            self.results["phases"]["shodan"] = {"records": len(dns_data)}
+            try:
+                intel["shodan_dns"] = await shodan.search_domain(domain)
+                providers["shodan"] = "completed"
+            except Exception as exc:
+                providers["shodan"] = f"failed: {type(exc).__name__}"
+        else:
+            providers["shodan"] = "skipped: API key unavailable"
+        if chaos.available:
+            try:
+                intel["chaos_subdomains"] = await chaos.subdomains(domain)
+                providers["chaos"] = "completed"
+            except Exception as exc:
+                providers["chaos"] = f"failed: {type(exc).__name__}"
+        else:
+            providers["chaos"] = "skipped: API key unavailable"
+        self.results["phases"]["external_intel"] = providers
+        self.results["intel"] = intel
+
+        templates = []
+        if self.api_spec_path:
+            templates.extend(
+                import_openapi(
+                    self.api_spec_path,
+                    self.target if "://" in self.target else f"https://{domain}/",
+                )
+            )
+        for path in self.har_paths:
+            templates.extend(import_har(path))
+        self.results["phases"]["api_inventory"] = {
+            "imported_templates": len(templates),
+            "read_templates_scanned": sum(t.method == "GET" for t in templates),
+            "other_methods_retained_not_sent": sum(t.method != "GET" for t in templates),
+        }
+
+        browser_result = await discover_browser(
+            self.target if "://" in self.target else f"https://{domain}/",
+            self.budget,
+            max_depth=0 if self.depth == "quick" else 1 if self.depth == "standard" else 2,
+            max_pages=5 if self.depth == "quick" else 10 if self.depth == "standard" else 20,
+            auth_headers=self.auth_headers,
+        )
+        self.results["phases"]["browser_discovery"] = {
+            key: value
+            for key, value in browser_result.items()
+            if key not in {"urls", "form_templates"}
+        }
+        self.results["phases"]["browser_discovery"]["urls_discovered"] = len(
+            browser_result.get("urls", [])
+        )
 
         # 5. The Armada — execute full DAG
         self.console.print(
@@ -130,10 +184,20 @@ class ScanPipeline:
         )
         shared: dict = {
             "target": domain,
+            "target_url": self.target if "://" in self.target else f"https://{domain}/",
             "depth": self.depth,
             "intel": intel,
             "raw_findings": [],
-            "endpoints": [],
+            "endpoints": [self.target if "://" in self.target else f"https://{domain}/"]
+            + [t.url for t in templates if t.method == "GET"]
+            + browser_result.get("urls", []),
+            "request_templates": templates,
+            "budget": self.budget,
+            "auth_headers": self.auth_headers,
+            "fuzz_payloads": self.fuzz_payloads,
+            "max_payload_variants": self.max_payload_variants,
+            "fuzz_cooldown_seconds": self.fuzz_cooldown_seconds,
+            "fuzz_memory": AuraMemoryManager.get_instance() if self.fuzz_payloads else None,
         }
         armada = ArmadaOrchestrator(workers=self.workers)
         for name, handler in build_scan_handlers(shared).items():
@@ -141,6 +205,7 @@ class ScanPipeline:
 
         graph = armada.plan_mission(domain, self.depth)
         armada_results = await armada.execute(graph, shared)
+        self.results["phases"]["armada_failures"] = armada_results.get("failures", [])
         raw_findings = list(armada_results.get("findings", [])) or shared.get("raw_findings", [])
 
         self.results["phases"]["armada"] = {
@@ -150,11 +215,15 @@ class ScanPipeline:
         }
 
         # Secondary: Arsenal heuristic probes
-        if self.arsenal_secondary:
+        if self.arsenal_secondary and not armada_results.get("failures"):
             self.console.print(
                 "[bold blue]󰋼[/bold blue] [white]Engaging secondary heuristic probes (The Arsenal)...[/white]"
             )
-            scanner = ArsenalScanner(verify_ssl=True)
+            scanner = ArsenalScanner(
+                verify_ssl=os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false",
+                budget=self.budget,
+                auth_headers=self.auth_headers,
+            )
             endpoints = shared.get("endpoints") or [f"https://{domain}"]
             limit = 25 if self.depth == "quick" else 50 if self.depth == "standard" else 100
             for url in endpoints[:limit]:
@@ -180,7 +249,25 @@ class ScanPipeline:
         seen: set[str] = set()
         unique: list[dict] = []
         for f in raw_findings:
-            key = f"{f.get('url', '')}|{f.get('type', f.get('vuln_type', ''))}"
+            identity_url = (
+                f.get("poc_url") or f.get("url")
+                if (f.get("payload_spec") or {}).get("method") == "GET_PATH"
+                else f.get("url")
+            )
+            key = "|".join(
+                [str(identity_url)]
+                + [
+                    str(f.get(field, ""))
+                    for field in (
+                        "type",
+                        "vuln_type",
+                        "request_method",
+                        "parameter",
+                        "payload",
+                        "proof_signal",
+                    )
+                ]
+            )
             if key not in seen:
                 seen.add(key)
                 unique.append(f)
@@ -189,23 +276,126 @@ class ScanPipeline:
         self.console.print(
             "[bold blue]󰋼[/bold blue] [white]Validating signals and correlating chains (The Crucible)...[/white]"
         )
+        crucible = CrucibleValidator(budget=self.budget, auth_headers=self.auth_headers)
         try:
-            crucible = CrucibleValidator(consensus=consensus)
-            validated = await crucible.validate_batch(unique)
+            outcomes = await crucible.validate_batch(unique)
+            identity_contracts = (
+                load_identity_contracts(self.identity_contract_path)
+                if self.identity_contract_path
+                else []
+            )
+            for contract in identity_contracts:
+                try:
+                    outcomes.append(await prove_identity(contract, self.budget))
+                except Exception as exc:
+                    outcomes.append(
+                        {
+                            "title": "Cross-identity private resource exposure",
+                            "check_key": "idor",
+                            "url": contract.owner_url,
+                            "validated": False,
+                            "validation_status": "inconclusive",
+                            "validation_reason": f"Identity proof could not complete: {type(exc).__name__}",
+                        }
+                    )
+            self.results["phases"]["identity_proof"] = {
+                "contracts": len(identity_contracts),
+                "validated": sum(
+                    item.get("validated", False)
+                    for item in outcomes
+                    if item.get("check_key") == "idor"
+                ),
+            }
+            state_contracts = (
+                load_state_contracts(self.state_contract_path) if self.state_contract_path else []
+            )
+            for state_contract in state_contracts:
+                try:
+                    outcomes.append(await observe_state_contract(state_contract, self.budget))
+                except Exception as exc:
+                    outcomes.append(
+                        {
+                            "title": "Operator-contracted API state change",
+                            "url": state_contract.write_url,
+                            "validated": False,
+                            "validation_status": "inconclusive",
+                            "validation_reason": f"State contract could not complete: {type(exc).__name__}",
+                        }
+                    )
+            self.results["phases"]["state_proof"] = {
+                "contracts": len(state_contracts),
+                "cleanup_failures": sum(
+                    bool((item.get("proof") or {}).get("cleanup_failed")) for item in outcomes
+                ),
+            }
+            ssrf_contracts = (
+                load_ssrf_contracts(self.ssrf_contract_path) if self.ssrf_contract_path else []
+            )
+            for ssrf_contract in ssrf_contracts:
+                try:
+                    outcomes.append(
+                        await prove_ssrf(ssrf_contract, self.budget, auth_headers=self.auth_headers)
+                    )
+                except Exception as exc:
+                    outcomes.append(
+                        {
+                            "title": "Server-side request to operator callback",
+                            "check_key": "ssrf",
+                            "url": ssrf_contract.probe_url,
+                            "validated": False,
+                            "validation_status": "inconclusive",
+                            "validation_reason": f"OAST proof could not complete: {type(exc).__name__}",
+                        }
+                    )
+            self.results["phases"]["ssrf_proof"] = {
+                "contracts": len(ssrf_contracts),
+                "validated": sum(
+                    item.get("validated", False)
+                    for item in outcomes
+                    if item.get("check_key") == "ssrf"
+                ),
+            }
+            if self.fuzz_payloads and shared["fuzz_memory"] is not None:
+                for outcome in outcomes:
+                    payload_spec = outcome.get("payload_spec") or {}
+                    fingerprint = payload_spec.get("mutation_fingerprint")
+                    mutation_name = payload_spec.get("mutation_name")
+                    url = outcome.get("url")
+                    check_key = outcome.get("check_key")
+                    status = outcome.get("validation_status")
+                    if not all((fingerprint, mutation_name, url, check_key)) or status not in {
+                        "validated",
+                        "rejected",
+                    }:
+                        continue
+                    target_key = hashlib.sha256(str(url).encode()).hexdigest()
+                    shared["fuzz_memory"].record_fuzz_outcome(
+                        target_key, check_key, fingerprint, status
+                    )
+                    shared["fuzz_memory"].record_fuzz_feedback(
+                        target_key, check_key, mutation_name, status == "validated"
+                    )
+            validated = [f for f in outcomes if f.get("validated")]
             self.results["findings"] = validated
+            self.results["manual_leads"] = [
+                f for f in outcomes if f.get("validation_status") in ("manual_lead", "inconclusive")
+            ]
+            self.results["rejected_candidates"] = (
+                len(outcomes) - len(validated) - len(self.results["manual_leads"])
+            )
             self.results["chains"] = await crucible.correlate_chains(validated)
         finally:
             await crucible.aclose()
-            await llm.aclose()
 
         registry = RegressionRegistry(self.results_dir / "regression")
         for f in validated:
             registry.register(f)
 
         # 6b. Crystallize Cognitive Memory Signals
-        from secagents.core.aura_memory import AuraMemoryManager, TargetDNA
+        from secagents.core.aura_memory import TargetDNA
+
         memory = AuraMemoryManager.get_instance()
-        
+
         # Remember Target DNA
         clean_domain = self.target.replace("https://", "").replace("http://", "").split("/")[0]
         memory.remember_target_dna(
@@ -213,7 +403,9 @@ class ScanPipeline:
                 target=self.target,
                 domain=clean_domain,
                 tech_stack=list(self.results.get("intel", {}).get("technologies", [])),
-                rate_limit_detected=any(f.get("type") == "missing_rate_limiting" for f in validated),
+                rate_limit_detected=any(
+                    f.get("type") == "missing_rate_limiting" for f in validated
+                ),
                 recommended_concurrency=10 if len(validated) < 5 else 5,
             )
         )
@@ -237,11 +429,70 @@ class ScanPipeline:
         patcher = AutoPatcher()
         patcher.apply_to_findings(validated)
         reporter = ReportGenerator(self.results_dir / "reports")
-        report_paths = reporter.generate_all(domain, validated, self.results["chains"])
+        self.results["budget"] = self.budget.snapshot()
+        report_paths = reporter.generate_all(
+            domain,
+            validated,
+            self.results["chains"],
+            manual_leads=self.results["manual_leads"],
+            coverage={
+                "armada_failures": self.results["phases"]["armada_failures"],
+                "armada_tasks": self.results["phases"]["armada"],
+                "external_tools": [
+                    v.get("external_tools", {})
+                    for v in armada_results.get("tasks", {}).values()
+                    if isinstance(v, dict) and v.get("external_tools")
+                ],
+                "skipped_stateful_checks": sum(
+                    v.get("skipped_stateful_checks", 0)
+                    for v in armada_results.get("tasks", {}).values()
+                    if isinstance(v, dict)
+                ),
+                "skipped_callback_checks": sum(
+                    v.get("skipped_callback_checks", 0)
+                    for v in armada_results.get("tasks", {}).values()
+                    if isinstance(v, dict)
+                ),
+                "payload_fuzzing": {
+                    "enabled": self.fuzz_payloads,
+                    "variants_generated": sum(
+                        v.get("fuzz_variants_generated", 0)
+                        for v in armada_results.get("tasks", {}).values()
+                        if isinstance(v, dict)
+                    ),
+                    "variants_sent": sum(
+                        v.get("fuzz_variants_sent", 0)
+                        for v in armada_results.get("tasks", {}).values()
+                        if isinstance(v, dict)
+                    ),
+                    "repeats_skipped": sum(
+                        v.get("fuzz_variants_repeated", 0)
+                        for v in armada_results.get("tasks", {}).values()
+                        if isinstance(v, dict)
+                    ),
+                    "variants_validated": sum(
+                        bool(item.get("validated"))
+                        for item in outcomes
+                        if (item.get("payload_spec") or {}).get("mutation_fingerprint")
+                    ),
+                },
+                "budget": self.results["budget"],
+                "api_inventory": self.results["phases"]["api_inventory"],
+                "browser_discovery": self.results["phases"]["browser_discovery"],
+                "browser_form_templates": len(browser_result.get("form_templates", [])),
+                "candidate_urls": sum(
+                    v.get("candidate_urls", 0)
+                    for v in armada_results.get("tasks", {}).values()
+                    if isinstance(v, dict)
+                ),
+                "urls_truncated": sum(
+                    v.get("urls_truncated", 0)
+                    for v in armada_results.get("tasks", {}).values()
+                    if isinstance(v, dict)
+                ),
+            },
+        )
         self.results["reports"] = report_paths
-
-        if sandbox:
-            sandbox.write_log("scan_summary.log", f"findings={len(validated)}\n")
 
         notifier = CINotifier()
         if report_paths.get("markdown"):

@@ -88,17 +88,10 @@ def _check_api_keys() -> CheckResult:
 
 def _check_disk_space() -> CheckResult:
     try:
-        import platform
+        import shutil
+        import tempfile
 
-        if platform.system() == "Windows":
-            import ctypes
-
-            free_bytes = ctypes.c_ulonglong(0)
-            ctypes.windll.kernel32.GetDiskFreeSpaceExW(None, None, None, ctypes.byref(free_bytes))
-            free_gb = free_bytes.value / (1024**3)
-        else:
-            stat = os.statvfs("/")
-            free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
+        free_gb = shutil.disk_usage(tempfile.gettempdir()).free / (1024**3)
 
         ok = free_gb >= 1.0
         return CheckResult(

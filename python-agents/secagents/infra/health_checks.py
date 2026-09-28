@@ -81,6 +81,7 @@ class HealthCheck:
 
             if pong:
                 return {"status": HealthStatus.HEALTHY, "connection_time_ms": 5}
+            return {"status": HealthStatus.UNHEALTHY, "error": "Redis ping returned false"}
         except asyncio.TimeoutError:
             return {"status": HealthStatus.UNHEALTHY, "error": "Redis connection timeout"}
         except Exception as e:

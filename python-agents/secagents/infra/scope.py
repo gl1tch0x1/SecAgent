@@ -23,6 +23,10 @@ class ScopePolicy:
         return cls(allowed_domains=allowed, blocked_domains=blocked)
 
     def check_target(self, target: str) -> None:
+        if "://" in target:
+            parsed = urlparse(target)
+            if parsed.scheme.lower() not in {"http", "https"} or parsed.username or parsed.password:
+                raise ScopeViolationError("Only credential-free HTTP(S) targets are allowed")
         domain = normalize_target(target)
         if not domain:
             raise ScopeViolationError("Invalid or empty target")

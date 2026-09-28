@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict
 import httpx
+from secagents.infra.scope import enforce_scope
+from secagents.infra.execution_budget import ExecutionBudget
 
 from secagents.agents.base import BaseAgent, AgentOutput, AgentConfig, AgentRole
-from secagents.arsenal.registry import ToolRegistry
 
 
 class IntelligentDecisionEngine(BaseAgent):
@@ -86,7 +85,11 @@ class CTFWorkflowManager(BaseAgent):
         flag = None
 
         # Inspect challenge input for flag pattern
-        flag_match = re.search(r"(flag\{[^{}]+\}|CTF\{[^{}]+\}|secagent\{[^{}]+\})", str(challenge_input), re.IGNORECASE)
+        flag_match = re.search(
+            r"(flag\{[^{}]+\}|CTF\{[^{}]+\}|secagent\{[^{}]+\})",
+            str(challenge_input),
+            re.IGNORECASE,
+        )
         if flag_match:
             flag = flag_match.group(1)
 
@@ -108,21 +111,20 @@ class CVEIntelligenceManager(BaseAgent):
         super().__init__(AgentConfig(role=AgentRole.RECON, name="cve_intelligence_manager"))
 
     def base_system_prompt(self) -> str:
-        return "CVE Intelligence Manager for correlating software versions with known vulnerabilities."
+        return (
+            "CVE Intelligence Manager for correlating software versions with known vulnerabilities."
+        )
 
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
         software = task.get("software", "")
         version = task.get("version", "")
 
-        matched_cves = []
-        risk_score = 0.0
+        candidates = []
 
         if "log4j" in software.lower():
-            matched_cves.append({"cve": "CVE-2021-44228", "severity": "CRITICAL", "score": 10.0})
-            risk_score = 10.0
+            candidates.append("CVE-2021-44228")
         elif "spring" in software.lower():
-            matched_cves.append({"cve": "CVE-2022-22965", "severity": "CRITICAL", "score": 9.8})
-            risk_score = 9.8
+            candidates.append("CVE-2022-22965")
 
         return AgentOutput(
             agent=self.name,
@@ -130,10 +132,12 @@ class CVEIntelligenceManager(BaseAgent):
             result={
                 "software": software,
                 "version": version,
-                "matched_cves": matched_cves,
-                "risk_score": risk_score,
+                "matched_cves": [],
+                "candidate_cves": candidates,
+                "status": "manual_lead" if candidates else "no_match",
+                "reason": "Product name alone does not establish an affected version or exploitability",
             },
-            confidence=0.91,
+            confidence=0.1 if candidates else 0.0,
         )
 
 
@@ -145,35 +149,14 @@ class AIExploitGenerator(BaseAgent):
         return "AI Exploit Generator for creating standalone PoC scripts for validated findings."
 
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
-        vuln_type = task.get("vuln_type") or task.get("type", "sqli")
-        target_url = task.get("url") or task.get("target", "http://target")
-        payload = task.get("payload", "' OR '1'='1")
+        from secagents.engine.poc_generator import PoCGenerator
 
-        poc_code = f"""#!/usr/bin/env python3
-# Standalone PoC Generator — {vuln_type.upper()}
-import requests
-
-target_url = "{target_url}"
-payload = "{payload}"
-
-print(f"[+] Testing {{target_url}} for {vuln_type.upper()}...")
-try:
-    response = requests.get(target_url, params={{"q": payload}}, timeout=10, verify=False)
-    print(f"[+] Response Status: {{response.status_code}}")
-    if response.status_code == 200:
-        print("[+] PoC Execution Successful!")
-except Exception as e:
-    print(f"[-] PoC Execution Error: {{e}}")
-"""
+        replay = PoCGenerator().generate(task)
         return AgentOutput(
             agent=self.name,
             role=self.role,
-            result={
-                "vuln_type": vuln_type,
-                "target_url": target_url,
-                "poc_code": poc_code,
-            },
-            confidence=0.92,
+            result=replay,
+            confidence=0.8 if replay["status"] == "replay_available" else 0.1,
         )
 
 
@@ -199,8 +182,12 @@ class VulnerabilityCorrelator(BaseAgent):
         return AgentOutput(
             agent=self.name,
             role=self.role,
-            result={"findings_analyzed": len(findings), "attack_chains": chains},
-            confidence=0.89,
+            result={
+                "findings_analyzed": len(findings),
+                "hypothesized_chains": chains,
+                "status": "manual_lead",
+            },
+            confidence=0.1,
         )
 
 
@@ -215,12 +202,19 @@ class TechnologyDetector(BaseAgent):
         target = task.get("target", "")
         verify_ssl = os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false"
         technologies = []
+        observed = False
 
         if target:
             try:
                 url = target if target.startswith("http") else f"https://{target}"
-                async with httpx.AsyncClient(timeout=5.0, verify=verify_ssl, follow_redirects=True) as client:
-                    resp = await client.get(url)
+                budget = ExecutionBudget(max_requests=1, max_duration_seconds=10)
+                async with httpx.AsyncClient(
+                    timeout=5.0, verify=verify_ssl, follow_redirects=False
+                ) as client:
+                    enforce_scope(url)
+                    async with budget.request(url):
+                        resp = await client.get(url)
+                    observed = True
                     server = resp.headers.get("server", "")
                     powered_by = resp.headers.get("x-powered-by", "")
 
@@ -236,14 +230,11 @@ class TechnologyDetector(BaseAgent):
             except Exception:
                 pass
 
-        if not technologies:
-            technologies = ["Generic Web HTTP/S Service"]
-
         return AgentOutput(
             agent=self.name,
             role=self.role,
-            result={"target": target, "technologies": technologies},
-            confidence=0.94,
+            result={"target": target, "technologies": technologies, "observed": observed},
+            confidence=0.7 if technologies else (0.3 if observed else 0.0),
         )
 
 
@@ -302,6 +293,7 @@ class PerformanceMonitor(BaseAgent):
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
         try:
             import psutil
+
             cpu_pct = psutil.cpu_percent(interval=0.1)
             ram_mb = psutil.Process().memory_info().rss / (1024 * 1024)
         except ImportError:
@@ -325,7 +317,13 @@ class ParameterOptimizer(BaseAgent):
 
     async def execute(self, task: Dict[str, Any]) -> AgentOutput:
         depth = task.get("depth", "standard")
-        flags = "-T4 --max-retries 2" if depth == "quick" else "-T4 --max-retries 3" if depth == "standard" else "-T5 -A"
+        flags = (
+            "-T4 --max-retries 2"
+            if depth == "quick"
+            else "-T4 --max-retries 3"
+            if depth == "standard"
+            else "-T5 -A"
+        )
 
         return AgentOutput(
             agent=self.name,

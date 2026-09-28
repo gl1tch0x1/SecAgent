@@ -41,6 +41,15 @@ async def test_process_manager_execution():
     assert "hello_secagent" in res["stdout"]
 
 
+@pytest.mark.asyncio
+async def test_process_manager_rejects_shell_strings():
+    pm = ProcessManager()
+    res = await pm.run_command("python -c print(1)")
+    assert res["success"] is False
+    assert "disabled" in res["stderr"]
+    assert pm.history == []
+
+
 def test_tool_registry_catalog():
     assert len(ToolRegistry.TOOLS_CATALOG) >= 50
     nmap = ToolRegistry.get_tool("nmap")
@@ -77,5 +86,14 @@ async def test_12_specialized_agents():
     assert len(agents) == 12
     for agent in agents:
         out = await agent.execute({"target": "example.com", "findings": [{"type": "sqli"}, {"type": "xss"}]})
-        assert out.confidence > 0.7
+        if isinstance(agent, AIExploitGenerator):
+            assert out.result["status"] == "manual_lead"
+            assert "poc_code" not in out.result
+        elif isinstance(agent, TechnologyDetector):
+            assert out.confidence == 0.0
+            assert out.result["observed"] is False
+        elif isinstance(agent, (CVEIntelligenceManager, VulnerabilityCorrelator)):
+            assert out.confidence <= 0.1
+        else:
+            assert out.confidence > 0.7
         assert out.agent == agent.name

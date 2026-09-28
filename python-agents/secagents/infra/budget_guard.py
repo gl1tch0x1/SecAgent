@@ -33,16 +33,22 @@ class BudgetGuard:
         self.total_completion_tokens = 0
         self.total_cost_usd = 0.0
 
-    def record_usage(self, prompt_tokens: int, completion_tokens: int, provider: str = "default") -> float:
+    def record_usage(
+        self, prompt_tokens: int, completion_tokens: int, provider: str = "default"
+    ) -> float:
         """Record token consumption and update accrued USD cost."""
         pricing = TOKEN_PRICING.get(provider.lower(), TOKEN_PRICING["default"])
-        cost = (prompt_tokens / 1000.0) * pricing["prompt"] + (completion_tokens / 1000.0) * pricing["completion"]
+        cost = (prompt_tokens / 1000.0) * pricing["prompt"] + (
+            completion_tokens / 1000.0
+        ) * pricing["completion"]
 
         self.total_prompt_tokens += prompt_tokens
         self.total_completion_tokens += completion_tokens
         self.total_cost_usd += cost
 
-        logger.info(f"Recorded {prompt_tokens}+{completion_tokens} tokens ({provider}). Total cost: ${self.total_cost_usd:.4f}")
+        logger.info(
+            f"Recorded {prompt_tokens}+{completion_tokens} tokens ({provider}). Total cost: ${self.total_cost_usd:.4f}"
+        )
         return cost
 
     def is_budget_exceeded(self) -> bool:

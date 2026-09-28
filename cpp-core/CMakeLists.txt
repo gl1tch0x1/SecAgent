@@ -23,6 +23,11 @@ add_library(secagent_core SHARED ${SOURCES})
 add_executable(secagent_core_bin src/main.cpp)
 target_link_libraries(secagent_core_bin PRIVATE secagent_core)
 
+enable_testing()
+add_executable(secagent_core_tests tests/fast_matcher_test.cpp)
+target_link_libraries(secagent_core_tests PRIVATE secagent_core)
+add_test(NAME fast_matcher COMMAND secagent_core_tests)
+
 if(WIN32)
     target_link_libraries(secagent_core PRIVATE ws2_32)
     target_link_libraries(secagent_core_bin PRIVATE ws2_32)
