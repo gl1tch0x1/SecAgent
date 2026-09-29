@@ -139,7 +139,12 @@ class CrucibleValidator:
                 )
                 return result
             proven, signal = verify_finding(key, response.text[:100_000], headers, payload)
-            if response.status_code in range(300, 500):
+            redirect_proof = (
+                key in {"open_redirect", "oauth_redirect"} and 300 <= response.status_code < 400
+            )
+            if 400 <= response.status_code < 500 or (
+                300 <= response.status_code < 400 and not redirect_proof
+            ):
                 proven = False
                 signal = "Redirect or client-error response cannot establish proof"
             elif not policy.negative_control and response.status_code >= 500:

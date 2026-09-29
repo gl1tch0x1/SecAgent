@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Dict, Any
 from enum import Enum
 import logging
+import os
 
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
@@ -348,4 +349,4 @@ async def get_all_agents_status():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.environ.get("SECAGENT_HEALTH_BIND", "127.0.0.1"), port=8000)

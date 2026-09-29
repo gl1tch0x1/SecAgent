@@ -61,6 +61,14 @@ jobs:
         if: matrix.language == 'python'
         run: ruff format python-agents/ --check
 
+      - name: Install bandit
+        if: matrix.language == 'python'
+        run: pip install bandit[toml]
+
+      - name: Run security lint
+        if: matrix.language == 'python'
+        run: bandit -r python-agents/secagents -q -ll -f txt
+
       # Rust
       - name: Set up Rust
         if: matrix.language == 'rust'

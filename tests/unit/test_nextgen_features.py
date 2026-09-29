@@ -1,6 +1,7 @@
 """Unit test suite for SecAgent Next-Gen Enhancements (MCP, Playbooks, Capsules, Teleoperation, Budget Guard)."""
 
 import json
+import io
 import sqlite3
 import sys
 import time
@@ -17,6 +18,7 @@ from secagents.operational.fuzzing import (
     byte_changes,
     payload_variants,
     run_binary_fuzz,
+    _run_program,
 )
 from secagents.core.aura_memory import AuraMemoryManager
 
@@ -136,6 +138,90 @@ def test_binary_fuzzer_bounds_output_capture_and_program_time(tmp_path: Path):
         report["cases"][0]["outcome"]["stdout"]["sha256"]
         == report["baseline"]["stdout"]["sha256"]
     )
+
+
+def test_binary_fuzzer_uses_instrumented_coverage_and_minimizes_crash(tmp_path: Path):
+    seed = tmp_path / "sample.bin"
+    seed.write_bytes(b"ABCD")
+    memory = AuraMemoryManager(db_path=tmp_path / "aura.db")
+    script = (
+        "import os,pathlib,sys; "
+        "data=pathlib.Path(sys.argv[1]).read_bytes(); "
+        "pathlib.Path(os.environ['SECAGENT_COVERAGE_FILE']).write_bytes(bytes([sum(data)%256])); "
+        "sys.stderr.write('AddressSanitizer: synthetic fixture\\n') if data != b'ABCD' else None; "
+        "sys.exit(77 if data != b'ABCD' else 0)"
+    )
+    config = BinaryFuzzConfig(
+        seed_path=seed,
+        results_dir=tmp_path / "results",
+        program=Path(sys.executable),
+        program_args=("-c", script, "{input}"),
+        allow_host_execution=True,
+        collect_coverage=True,
+        minimize_crashes=True,
+        runs=1,
+        timeout_seconds=3,
+        max_duration_seconds=20,
+    )
+    report = run_binary_fuzz(config, memory)
+    assert report["summary"]["novel_coverage_states"] == 1
+    assert report["summary"]["novel_crashes"] == 1
+    assert report["summary"]["minimization_executions"] >= 1
+    assert report["cases"][0]["outcome"]["sanitizer_signal"] == "AddressSanitizer"
+    assert (
+        Path(report["cases"][0]["minimized_input"]).stat().st_size < seed.stat().st_size
+    )
+
+
+def test_binary_docker_mode_requires_exclusive_execution_choice():
+    with pytest.raises(ValueError, match="not both"):
+        BinaryFuzzConfig(
+            seed_path=Path("input.bin"),
+            results_dir=Path("results"),
+            program=Path(sys.executable),
+            allow_host_execution=True,
+            docker_image="python:3.11",
+        )
+
+
+def test_binary_docker_command_has_no_network_and_resource_limits(
+    tmp_path: Path, monkeypatch
+):
+    import secagents.operational.fuzzing as fuzzing
+
+    program = tmp_path / "parser"
+    program.write_bytes(b"fixture")
+    input_path = tmp_path / "input.bin"
+    input_path.write_bytes(b"input")
+    seen = []
+
+    class FakeProcess:
+        stdout = io.BytesIO(b"")
+        stderr = io.BytesIO(b"")
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(
+        fuzzing.subprocess,
+        "Popen",
+        lambda command, **kwargs: seen.append(command) or FakeProcess(),
+    )
+    config = BinaryFuzzConfig(
+        seed_path=input_path,
+        results_dir=tmp_path,
+        program=program,
+        docker_image="local/parser:latest",
+    )
+    _run_program(config, input_path, tmp_path, 1.0)
+    command = seen[0]
+    assert command[:2] == ["docker", "run"]
+    assert "--network=none" in command
+    assert "--read-only" in command
+    assert "--pull=never" in command
+    assert "--cap-drop=ALL" in command
+    assert "--memory=256m" in command
 
 
 def test_fuzz_cli_binary_mutation_needs_no_scan_target(tmp_path: Path):

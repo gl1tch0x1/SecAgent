@@ -13,6 +13,7 @@ import httpx
 
 from secagents.infra.execution_budget import ExecutionBudget
 from secagents.infra.scope import enforce_scope
+from secagents.infra.security_policy import OperationAuthorization, SecurityPolicy
 from secagents.modules.oast_browser import OASTClient
 
 
@@ -56,9 +57,18 @@ async def prove_ssrf(
     auth_headers: dict[str, str] | None = None,
     provider_client: httpx.AsyncClient | None = None,
     target_client: httpx.AsyncClient | None = None,
+    policy: SecurityPolicy | None = None,
 ) -> dict:
     """Require a clean control and two independently registered callbacks."""
     enforce_scope(contract.probe_url)
+    policy = policy or SecurityPolicy.from_env(contracted_ssrf=True)
+    policy.validate_target(contract.probe_url)
+    policy.validate_operation(
+        "ssrf_probe",
+        is_ssrf=True,
+        target=contract.probe_url,
+        proof_artifact=OperationAuthorization("ssrf_contract", "ssrf_probe", contract.probe_url),
+    )
     token = os.environ.get(contract.provider_token_env, "")
     if not token:
         raise ValueError("OAST provider token environment variable is unset")

@@ -4,6 +4,7 @@ import pytest
 from secagents.core.cache import SmartCache
 from secagents.core.process_manager import ProcessManager
 from secagents.arsenal.registry import ToolRegistry
+from secagents.arsenal.tools import ToolOutputParser
 from secagents.agents.browser_agent import BrowserAgent
 from secagents.agents.specialized import (
     IntelligentDecisionEngine,
@@ -19,6 +20,20 @@ from secagents.agents.specialized import (
     ParameterOptimizer,
     GracefulDegradation,
 )
+
+
+def test_nmap_xml_parser_rejects_entities_and_keeps_valid_ports():
+    valid = (
+        '<nmaprun><host><address addr="127.0.0.1"/><ports>'
+        '<port portid="80"><state state="open"/></port>'
+        "</ports></host></nmaprun>"
+    )
+    parsed = ToolOutputParser.parse_nmap_xml(valid)
+    assert parsed[0]["ip"] == "127.0.0.1"
+    assert parsed[0]["port"] == 80
+
+    malicious = '<!DOCTYPE nmaprun [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><nmaprun>&xxe;</nmaprun>'
+    assert ToolOutputParser.parse_nmap_xml(malicious) == []
 
 
 def test_smart_cache_lru():

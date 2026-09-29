@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -17,8 +18,8 @@ OS_UPDATE_MESSAGE = (
     "Please run 'sudo apt update && sudo apt upgrade -y' and re-run the tool."
 )
 
-GITHUB_REPO = os.environ.get("SECAGENT_GITHUB_REPO", "gl1tch0x1/cog-ai")
-CURRENT_VERSION = "0.2.0"
+GITHUB_REPO = os.environ.get("SECAGENT_GITHUB_REPO", "gl1tch0x1/SecAgent")
+CURRENT_VERSION = "0.3.0"
 
 
 class UpdateCheckResult(NamedTuple):
@@ -130,60 +131,36 @@ def check_tool_update(local_version: str = CURRENT_VERSION) -> UpdateCheckResult
     return UpdateCheckResult(available, local_version, remote, msg)
 
 
-def _backup_before_update(root: Path) -> list[Path]:
-    """Back up config.yaml and note venv path before pull."""
-    backed: list[Path] = []
-    for name in ("config.yaml", "config.yml", ".env"):
-        src = root / name
-        if src.exists():
-            dst = root / f"{name}.bak"
-            shutil.copy2(src, dst)
-            backed.append(dst)
-    return backed
-
-
 def check_and_apply_tool_update(
     root: Path | None = None,
     auto_update: bool = True,
 ) -> tuple[bool, str]:
-    """
-    Compare local version to GitHub; optionally git pull.
-    Returns (proceed, message).
-    """
-    root = root or Path.cwd()
-    result = check_tool_update()
-    if not result.update_available:
-        return True, result.message
-
+    """Delegate source updates to the guarded updater; report failure honestly."""
+    checkout = (root or Path.cwd()).resolve()
+    script = checkout / "update.py"
+    if not script.is_file():
+        release_status = check_tool_update()
+        suffix = (
+            "; update a source checkout with update.py" if release_status.update_available else ""
+        )
+        return not release_status.update_available, release_status.message + suffix
+    command = [sys.executable, str(script)]
     if not auto_update:
-        return True, f"{result.message} (auto-update disabled)"
-
-    _backup_before_update(root)
-
-    if (root / ".git").exists() and shutil.which("git"):
-        try:
-            subprocess.run(
-                ["git", "pull", "--ff-only"],
-                cwd=str(root),
-                capture_output=True,
-                text=True,
-                timeout=180,
-                check=True,
-            )
-            return True, "Updation Completed, Now you may Proceed..."
-        except subprocess.CalledProcessError as e:
-            return True, f"Git pull failed: {e.stderr or e}; continuing with local version"
-
-    if shutil.which("docker"):
-        try:
-            subprocess.run(
-                ["docker", "pull", "ghcr.io/gl1tch0x1/cog-ai:latest"],
-                capture_output=True,
-                timeout=300,
-                check=False,
-            )
-            return True, "Updation Completed, Now you may Proceed..."
-        except subprocess.TimeoutExpired:
-            pass
-
-    return True, result.message
+        command.append("--check-only")
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"Updater failed: {exc}"
+    if completed.returncode:
+        return False, f"Updater failed: {(completed.stderr or completed.stdout).strip()[-300:]}"
+    return (
+        True,
+        "Update check completed" if not auto_update else "Update and installation completed",
+    )

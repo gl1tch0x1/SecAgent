@@ -360,19 +360,20 @@ flowchart TD
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/gl1tch0x1/cog-ai.git
-cd cog-ai
+git clone https://github.com/gl1tch0x1/SecAgent.git
+cd SecAgent
 
 # 2. Run the automated deployment engine
 python installer.py
 
-# 3. Configure environment secrets
-cp .env.example .env
-nano .env  # Add OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY
+# 3. Explicitly authorize the domain you own or have permission to assess
+./secagent scope --add app.example
 
 # 4. Initiate an autonomous red-team scan
-secagent scan --target example.com --depth standard
+./secagent scan --target app.example --depth standard
 ```
+
+For an explicitly authorized one-off target, add `--authorize-targets` to `scan`; this authorizes only that command and still respects `BLOCKED_DOMAINS`. For a list, place one domain or root URL per line in a UTF-8 file, then run `./secagent scan --targets-file targets.txt --authorize-targets`. Batch scans validate all targets before starting, run serially, and accept up to 100 targets. Session headers and identity, state, or callback contracts must be scanned separately per target. To persist a larger approved scope, use `./secagent scope --add app.example --add api.example` or `./secagent scope --file approved-domains.txt` (up to 1000 entries). The default remains fail-closed when no scope is supplied.
 
 ---
 
@@ -391,11 +392,13 @@ secagent scan --target example.com --depth standard
 
 ### Method 1 — Automated Installation Engine (Recommended)
 
-The installer sets up virtual environments, mounts core dependencies, creates entrypoints, and verifies system integrity:
+The installer sets up a virtual environment, installs the Python package, creates entrypoints, and verifies that the CLI starts:
 
 ```bash
-python installer.py
+python installer.py --allowed-domains app.example
 ```
+
+The installer uses a compact live terminal display and clears it before showing the final command list. It creates `.env` without authorizing a target by default. Use `--allowed-domains` during setup or `./secagent scope --add DOMAIN` afterward; scans remain blocked until the target is explicitly allowed. On Windows, use `.\secagent.bat` in place of `./secagent`. Run `./secagent --help` to verify the entrypoint.
 
 ### Method 2 — Manual Package Installation
 
@@ -419,7 +422,7 @@ pip install -e ./python-agents[dev,browser]
 ##  Releases, Deployments & Packages
 
 ###  Releases
-- **Current Version**: `v0.3.0-dev`
+- **Current Version**: `v0.3.0`
 - **Release Tracking**: Managed via [CHANGELOG.md](file:///c:/Users/Acer/Downloads/SecAgent-Updated/SecAgent-Updated/CHANGELOG.md)
 - **Tagging**: Follows Semantic Versioning (`MAJOR.MINOR.PATCH`).
 
@@ -453,7 +456,7 @@ The Python agent core is packaged as a standard PyPI wheel:
 cd python-agents
 python -m build
 ```
-Artifact generated: `python-agents/dist/secagents-0.2.0-py3-none-any.whl`.
+Artifact generated: `python-agents/dist/secagents-0.3.0-py3-none-any.whl`.
 
 ---
 
@@ -565,7 +568,15 @@ To compare a parser's exit status and output bytes, explicitly opt into running 
 secagent fuzz binary ./sample.bin --program ./parser --allow-host-execution --runs 128
 ```
 
-The binary command never modifies the program. It writes a JSON report and a bounded set of interesting mutated inputs to `cog-ai-results/fuzz/`. Reports include seed/program hashes, mutation operator and offset, changed input byte and bit positions, bounded stdout/stderr hashes and bit differences, exit status, timeouts, repeat counts and termination reason. Insertions and deletions shift subsequent positional offsets. Treat reports and saved cases as sensitive because byte differences can expose input or output content. Program execution is **on the host**, with per-run and total deadlines but without process or network isolation; run untrusted programs inside an operator-managed VM or container. Output comparison retains only the configured prefix, and crashes or changed output are triage signals rather than proven vulnerabilities.
+For an existing compatible local Docker image, run the parser with network disabled, read-only mounts, a read-only filesystem, dropped capabilities and resource limits:
+
+```bash
+secagent fuzz binary ./sample.bin --program ./parser --docker-image local/parser-runtime:latest --runs 128 --minimize-crashes
+```
+
+The image must already exist locally and contain the program's runtime dependencies. Container execution does not pull images. For an instrumented host parser, `--collect-coverage` passes `SECAGENT_COVERAGE_FILE`; the parser should write a bounded edge or path coverage bitmap there. New coverage hashes guide operator selection. The command also recognizes common sanitizer messages and can try up to eight deletion probes to reduce a new crash input. These are triage aids, not a claim of complete coverage or a proven vulnerability.
+
+The binary command never modifies the program. It writes a JSON report and a bounded set of interesting mutated inputs to `cog-ai-results/fuzz/`. Reports include seed/program hashes, mutation operator and offset, changed input byte and bit positions, bounded stdout/stderr hashes and bit differences, exit status, timeouts, repeat counts, coverage hashes when supplied, and termination reason. Insertions and deletions shift subsequent positional offsets. Treat reports and saved cases as sensitive because byte differences can expose input or output content. `--allow-host-execution` runs the parser **on the host** without process or network isolation; prefer the Docker option or an operator-managed VM for untrusted parsers. Output comparison retains only the configured prefix, and crashes or changed output are triage signals rather than proven vulnerabilities.
 
 ### Opt-in proof contracts
 
@@ -640,10 +651,15 @@ Options:
 secagent hardware
 ```
 
-#### 6. `secagent update` — Intelligence Synchronization
+#### 7. `secagent update` — Source update
 ```bash
-secagent update
+./secagent update --check-only
+./secagent update
+# Or run the updater directly:
+python update.py --allowed-domains app.example
 ```
+
+The updater fetches `origin/main`, reports newer commits, and advances `main` only when the working tree is clean and the update is a fast-forward. It then runs the installer and returns an error if installation fails. It never resets or discards local changes. Use `--reinstall` to verify an already current checkout. Packaged installations without `update.py` report release status; update those through their package manager.
 
 ---
 

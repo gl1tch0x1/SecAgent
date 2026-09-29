@@ -17,7 +17,11 @@ def _normalize_bool(value: str | bool | None, default: bool = False) -> bool:
         return value
     if value is None:
         return default
-    return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
+    if str(value).strip().lower() in {"0", "false", "no", "off", ""}:
+        return False
+    if str(value).strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    raise ValueError(f"Unsupported boolean value: {value!r}")
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,7 @@ def _parse_allowed_domains(raw: str | None) -> list[str]:
 def build_scan_config(args: object | None = None, env: dict[str, str] | None = None) -> ScanConfig:
     if env is None:
         env = dict(os.environ)
+
     if args is not None:
         target = getattr(args, "target", env.get("SECAGENT_TARGET", ""))
         depth = getattr(args, "depth", env.get("SECAGENT_DEPTH", "standard"))
@@ -83,11 +88,12 @@ def build_scan_config(args: object | None = None, env: dict[str, str] | None = N
         results_dir = getattr(
             args, "results_dir", env.get("SECAGENT_RESULTS_DIR", "cog-ai-results")
         )
-        verify_ssl = _normalize_bool(
-            getattr(args, "insecure", None),
-            default=not _normalize_bool(env.get("SECAGENT_VERIFY_SSL", "true"), default=True),
-        )
-        check_ssl = not bool(getattr(args, "insecure", False))
+        env_verify_ssl = env.get("SECAGENT_VERIFY_SSL", "true")
+        cli_insecure = getattr(args, "insecure", None)
+        if cli_insecure is not None:
+            check_ssl = not bool(cli_insecure)
+        else:
+            check_ssl = _normalize_bool(env_verify_ssl, default=True)
     else:
         target = env.get("SECAGENT_TARGET", "")
         depth = env.get("SECAGENT_DEPTH", "standard")
@@ -97,10 +103,15 @@ def build_scan_config(args: object | None = None, env: dict[str, str] | None = N
         max_duration = float(env.get("SECAGENT_MAX_DURATION", "900"))
         results_dir = env.get("SECAGENT_RESULTS_DIR", "cog-ai-results")
         check_ssl = _normalize_bool(env.get("SECAGENT_VERIFY_SSL", "true"), default=True)
-        verify_ssl = check_ssl
 
     allowed = _parse_allowed_domains(env.get("ALLOWED_DOMAINS"))
     blocked = _parse_allowed_domains(env.get("BLOCKED_DOMAINS"))
+    if not allowed:
+        raise ValueError(
+            "ALLOWED_DOMAINS is not configured. Run 'secagent scope --add DOMAIN' "
+            "or pass --authorize-targets to explicitly authorize this scan."
+        )
+
     return ScanConfig(
         target=target,
         depth=depth,
@@ -108,7 +119,7 @@ def build_scan_config(args: object | None = None, env: dict[str, str] | None = N
         max_requests=max_requests,
         requests_per_second_per_host=rps,
         max_duration_seconds=max_duration,
-        check_ssl=check_ssl and verify_ssl,
+        check_ssl=check_ssl,
         use_sandbox=not _normalize_bool(
             env.get("SECAGENT_DISABLE_SANDBOX", "false"), default=False
         ),

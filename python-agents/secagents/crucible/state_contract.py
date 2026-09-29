@@ -12,6 +12,7 @@ import httpx
 from secagents.crucible.identity_proof import _header_from_env
 from secagents.infra.execution_budget import BudgetExceeded, ExecutionBudget
 from secagents.infra.scope import enforce_scope
+from secagents.infra.security_policy import OperationAuthorization, SecurityPolicy
 
 
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -68,10 +69,23 @@ async def observe_state_contract(
     budget: ExecutionBudget,
     *,
     client: httpx.AsyncClient | None = None,
+    policy: SecurityPolicy | None = None,
 ) -> dict:
     """Run one controlled write and two independent probes, cleaning each in finally."""
     for url in (contract.read_url, contract.write_url, contract.cleanup_url):
         enforce_scope(url)
+    policy = policy or SecurityPolicy.from_env(contracted_write=True)
+    for operation, url in (
+        ("state_write", contract.write_url),
+        ("state_cleanup", contract.cleanup_url),
+    ):
+        policy.validate_target(url)
+        policy.validate_operation(
+            operation,
+            is_write=True,
+            target=url,
+            proof_artifact=OperationAuthorization("state_contract", operation, url),
+        )
     if (
         budget.max_requests - budget.snapshot()["requests_used"] < 13
         or budget.remaining_seconds() < 90

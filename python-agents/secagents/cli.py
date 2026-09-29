@@ -34,11 +34,11 @@ from rich.box import ROUNDED, DOUBLE_EDGE
 from secagents import __version__
 from secagents.config import load_runtime_config
 from secagents.infra.telemetry import MetricsCollector, configure_logging
-from secagents.operational.integrity import check_and_apply_tool_update
+from secagents.operational.integrity import check_tool_update
 from secagents.vault.env_loader import Vault
 from secagents.pipeline.runner import ScanPipeline
 from secagents.infra.preflight import run_preflight
-from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.infra.scope import enforce_scope, normalize_target, ScopeViolationError
 from secagents.agents.keyhacks import KeyhacksAgent
 from secagents.whichllm.hardware import detect_hardware
 
@@ -75,12 +75,14 @@ BANNER = r"""
 def print_banner():
     banner_text = Text(BANNER, style="hacker")
     subtext = Text.from_markup(
-        f"\n[bold white]SECAGENT[/]\n[dim]Version {__version__} | authorized security assessment workflow[/]\n"
+        f"\n[bold white]SECAGENT // OFFENSIVE OPERATIONS CONSOLE[/]"
+        f"\n[bold cyan]RECON[/] [dim]·[/] [bold magenta]VERIFY[/] [dim]·[/] [bold green]REPORT[/]"
+        f"\n[dim]Version {__version__} | authorized security assessment workflow[/]\n"
     )
     console.print(
         Panel(
             Group(banner_text, subtext),
-            border_style="#66ffcc",
+            border_style="#00ff66",
             box=DOUBLE_EDGE,
             expand=False,
             padding=(1, 2),
@@ -123,7 +125,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Scan Command
     scan = sub.add_parser("scan", help="Execute autonomous red-team pipeline")
-    scan.add_argument("--target", "-t", required=True, help="Target domain or root URL")
+    scan_target = scan.add_mutually_exclusive_group(required=True)
+    scan_target.add_argument("--target", "-t", help="Target domain or root URL")
+    scan_target.add_argument(
+        "--targets-file", help="UTF-8 file with one target domain or URL per line"
+    )
+    scan.add_argument(
+        "--authorize-targets",
+        action="store_true",
+        help="Explicitly authorize the supplied targets for this command only",
+    )
     scan.add_argument(
         "--depth",
         choices=["quick", "standard", "deep"],
@@ -204,6 +215,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly allow running the selected program on this host",
     )
+    binary.add_argument(
+        "--docker-image",
+        help="Run the local parser inside an existing network-disabled Docker image",
+    )
+    binary.add_argument(
+        "--collect-coverage",
+        action="store_true",
+        help="Read SECAGENT_COVERAGE_FILE written by an instrumented host program",
+    )
+    binary.add_argument(
+        "--minimize-crashes", action="store_true", help="Try up to eight crash-reducing probes"
+    )
     binary.add_argument("--runs", type=int, default=128, help="Maximum distinct mutations (1-5000)")
     binary.add_argument("--timeout", type=float, default=2.0, help="Seconds per program execution")
     binary.add_argument("--max-duration", type=float, default=300.0, help="Total fuzzing seconds")
@@ -236,7 +259,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Infrastructure Commands
     sub.add_parser("preflight", help="Validate system readiness")
-    sub.add_parser("update", help="Check and apply framework updates")
+    scope = sub.add_parser("scope", help="Manage the explicit scan target allowlist")
+    scope.add_argument(
+        "--add",
+        action="append",
+        metavar="DOMAIN",
+        help="Authorize a domain; repeat or use comma-separated domains",
+    )
+    scope.add_argument(
+        "--file", action="append", metavar="PATH", help="Import a UTF-8 list of authorized domains"
+    )
+    scope.add_argument("--list", action="store_true", help="Show the current allowlist")
+    scope.add_argument("--env", default=".env", help="Path to the local configuration file")
+    update = sub.add_parser("update", help="Check and safely apply main branch updates")
+    update.add_argument(
+        "--check-only", action="store_true", help="Report newer commits without changing files"
+    )
+    update.add_argument(
+        "--reinstall", action="store_true", help="Verify installation even when current"
+    )
+    update.add_argument(
+        "--allowed-domains", help="Pass explicit authorized domains to the installer"
+    )
     sub.add_parser("hardware", help="Hardware-aware model optimization")
     sub.add_parser("worker", help="Start background workflow processor")
 
@@ -279,10 +323,110 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+_DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def _valid_scope_domain(value: str) -> bool:
+    host = value.removeprefix("*.")
+    return bool(
+        host
+        and len(value) <= 253
+        and all(_DOMAIN_LABEL.fullmatch(label) for label in host.split("."))
+    )
+
+
+def _read_target_lines(path: Path, *, max_entries: int = 100) -> list[str]:
+    if path.stat().st_size > 1_048_576:
+        raise ValueError("Target list exceeds the 1 MiB limit")
+    entries = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not entries or len(entries) > max_entries:
+        raise ValueError(f"Target list must contain 1 to {max_entries} non-comment lines")
+    return list(dict.fromkeys(entries))
+
+
+def _authorize_for_command(targets: list[str]) -> None:
+    domains = [
+        item.strip() for item in os.environ.get("ALLOWED_DOMAINS", "").split(",") if item.strip()
+    ]
+    for target in targets:
+        host = normalize_target(target)
+        if host.startswith("*.") or not _valid_scope_domain(host):
+            raise ValueError(f"Invalid target domain: {target}")
+        if host not in domains:
+            domains.append(host)
+    previous = os.environ.get("ALLOWED_DOMAINS")
+    os.environ["ALLOWED_DOMAINS"] = ",".join(domains)
+    try:
+        for target in targets:
+            enforce_scope(target)
+    except ScopeViolationError:
+        if previous is None:
+            os.environ.pop("ALLOWED_DOMAINS", None)
+        else:
+            os.environ["ALLOWED_DOMAINS"] = previous
+        raise
+
+
+async def cmd_scan_batch(args: argparse.Namespace) -> int:
+    try:
+        targets = _read_target_lines(Path(args.targets_file))
+        if any(
+            (
+                args.header_env,
+                args.cookie_env,
+                args.identity_contract,
+                args.state_contract,
+                args.ssrf_contract,
+            )
+        ):
+            raise ValueError(
+                "Batch scans do not accept shared session or proof contracts; run those targets separately"
+            )
+        if args.authorize_targets:
+            _authorize_for_command(targets)
+        else:
+            for target in targets:
+                enforce_scope(target)
+    except (OSError, UnicodeError, ValueError, ScopeViolationError) as exc:
+        console.print(f"[error]Target list rejected:[/error] {exc}")
+        return 2
+
+    console.print(
+        Panel(
+            f"{len(targets)} scoped target(s) queued",
+            title="[bold green]// BATCH MISSION //[/bold green]",
+            border_style="green",
+        )
+    )
+    failures = 0
+    for index, target in enumerate(targets, 1):
+        console.print(f"[bold cyan][{index}/{len(targets)}][/bold cyan] {target}")
+        target_args = argparse.Namespace(**vars(args))
+        target_args.target = target
+        target_args.authorize_targets = False
+        target_args.results_dir = str(Path(args.results_dir) / "batch" / normalize_target(target))
+        if await cmd_scan(target_args):
+            failures += 1
+    console.print(
+        Panel(
+            f"{len(targets) - failures} completed / {failures} failed",
+            title="BATCH SUMMARY",
+            border_style="green" if not failures else "red",
+        )
+    )
+    return 0 if not failures else 2
+
+
 async def cmd_scan(args: argparse.Namespace) -> int:
     try:
+        if getattr(args, "authorize_targets", False):
+            _authorize_for_command([args.target])
         config = load_runtime_config(args)
-    except ValueError as exc:
+    except (ValueError, ScopeViolationError) as exc:
         console.print(f"[error]Configuration error:[/error] {exc}")
         return 2
 
@@ -322,10 +466,25 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         console.print(f"[error]Session configuration error:[/error] {exc}")
         return 2
 
-    console.print(
-        f"\n[bold magenta]󰋼[/bold magenta] [bold white]INITIATING OPERATION:[/bold white] [target]{args.target}[/target]"
+    brief = Table.grid(padding=(0, 2))
+    brief.add_column(style="bold cyan", min_width=12)
+    brief.add_column(style="bold white")
+    brief.add_row("TARGET", args.target)
+    brief.add_row("PROFILE", f"{args.depth.upper()}  /  {args.workers} WORKERS")
+    brief.add_row(
+        "TRAFFIC CAP",
+        f"{args.max_requests} REQUESTS  /  {args.rate_limit:g} RPS PER HOST  /  {args.max_duration:g}s",
     )
-    console.print(f"[dim]Parameters: depth={args.depth}, workers={args.workers}[/dim]\n")
+    brief.add_row("SCOPE LOCK", "[bold green]AUTHORIZED[/bold green]")
+    console.print(
+        Panel(
+            brief,
+            title="[bold green]// MISSION PARAMETERS //[/bold green]",
+            subtitle="[dim]SCOPED EXECUTION[/dim]",
+            border_style="green",
+            expand=False,
+        )
+    )
 
     try:
         pipeline = ScanPipeline(
@@ -471,6 +630,9 @@ def cmd_fuzz(args: argparse.Namespace) -> int:
             program=Path(args.program) if args.program else None,
             program_args=tuple(args.arg),
             allow_host_execution=args.allow_host_execution,
+            docker_image=args.docker_image,
+            collect_coverage=args.collect_coverage,
+            minimize_crashes=args.minimize_crashes,
             runs=args.runs,
             timeout_seconds=args.timeout,
             max_duration_seconds=args.max_duration,
@@ -492,6 +654,47 @@ def cmd_fuzz(args: argparse.Namespace) -> int:
     except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
         console.print(f"[error]Fuzzing configuration or execution failed:[/error] {exc}")
         return 2
+
+
+def cmd_scope(args: argparse.Namespace) -> int:
+    """Persist an explicit operator-supplied scope without changing other secrets."""
+    path = Path(args.env)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        current = next(
+            (line.partition("=")[2] for line in lines if line.startswith("ALLOWED_DOMAINS=")), ""
+        )
+        domains = [item.strip().lower() for item in current.split(",") if item.strip()]
+        requested = [
+            item.strip().lower() for group in (args.add or []) for item in group.split(",")
+        ]
+        for filename in args.file or []:
+            requested.extend(
+                item.strip().lower()
+                for line in _read_target_lines(Path(filename), max_entries=1000)
+                for item in line.split(",")
+            )
+        if len(requested) > 1000:
+            raise ValueError("Scope import exceeds 1000 domains")
+        if requested:
+            if any(not _valid_scope_domain(item) for item in requested):
+                raise ValueError(
+                    "Use domain names or *.domain patterns without URLs or empty entries"
+                )
+            domains = list(dict.fromkeys([*domains, *requested]))
+            lines = [line for line in lines if not line.startswith("ALLOWED_DOMAINS=")]
+            lines.append("ALLOWED_DOMAINS=" + ",".join(domains))
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.environ["ALLOWED_DOMAINS"] = ",".join(domains)
+            console.print(
+                f"[success]Authorized {len(domains)} domain(s):[/success] {', '.join(domains)}"
+            )
+        if args.list or not requested:
+            console.print(f"Authorized domains: {', '.join(domains) or '(none configured)'}")
+    except (OSError, UnicodeError, ValueError) as exc:
+        console.print(f"[error]Scope update failed:[/error] {exc}")
+        return 2
+    return 0
 
 
 async def cmd_vault(args: argparse.Namespace) -> int:
@@ -603,24 +806,26 @@ def main() -> None:
         configure_logging(args.log_level, args.json_output)
         sys.exit(cmd_fuzz(args))
 
-    try:
-        runtime = load_runtime_config(args)
-    except ValueError as exc:
-        parser.exit(2, f"Configuration error: {exc}\n")
+    if args.command == "scope":
+        sys.exit(cmd_scope(args))
 
-    logger = configure_logging(runtime.log_level, runtime.json_output)
+    logger = configure_logging(args.log_level, args.json_output)
     metrics = MetricsCollector()
     metrics.increment("cli_invocations")
     logger.info(
         "secagent startup",
-        extra={"event": "cli.start", "target": runtime.target, "log_level": runtime.log_level},
+        extra={
+            "event": "cli.start",
+            "target": getattr(args, "target", ""),
+            "log_level": args.log_level,
+        },
     )
 
     print_banner()
 
     try:
         if args.command == "scan":
-            sys.exit(asyncio.run(cmd_scan(args)))
+            sys.exit(asyncio.run(cmd_scan_batch(args) if args.targets_file else cmd_scan(args)))
         elif args.command == "vault":
             sys.exit(asyncio.run(cmd_vault(args)))
         elif args.command == "keyhacks":
@@ -643,11 +848,21 @@ def main() -> None:
         elif args.command == "update":
             update_script = Path(__file__).parent.parent.parent / "update.py"
             if update_script.exists():
-                subprocess.run([sys.executable, str(update_script)], check=False)
+                command = [sys.executable, str(update_script)]
+                if args.check_only:
+                    command.append("--check-only")
+                if args.reinstall:
+                    command.append("--reinstall")
+                if args.allowed_domains:
+                    command.extend(["--allowed-domains", args.allowed_domains])
+                sys.exit(subprocess.run(command, check=False).returncode)
             else:
                 with console.status("[bold magenta]Checking for framework updates..."):
-                    _, msg = check_and_apply_tool_update()
-                console.print(Panel(msg, title="UPDATE STATUS", border_style="magenta"))
+                    release_status = check_tool_update()
+                message = release_status.message
+                if release_status.update_available:
+                    message += "; update a source checkout with update.py"
+                console.print(Panel(message, title="UPDATE STATUS", border_style="magenta"))
         elif args.command == "hardware":
             profile = detect_hardware()
             console.print(

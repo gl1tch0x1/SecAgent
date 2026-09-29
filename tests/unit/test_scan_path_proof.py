@@ -11,6 +11,8 @@ from secagents.crucible.validation import CrucibleValidator
 from secagents.modules.cve_checks import CHECKS
 from secagents.modules.cve_scanner import CVEScanner, ScanConfig
 from secagents.remediation.reporter import ReportGenerator
+from secagents.infra.request_inventory import RequestTemplate
+from secagents.pipeline.runner import ScanPipeline
 
 
 @pytest.mark.asyncio
@@ -173,3 +175,46 @@ def test_report_redacts_common_credentials_and_records_coverage(tmp_path):
     assert len(sarif["runs"][0]["results"]) == 1
     for path in paths.values():
         assert "private-value" not in Path(path).read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_empty_api_inventory_and_skipped_browser_do_not_abort(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    pipeline = ScanPipeline("https://example.com", results_dir=tmp_path)
+    assert await pipeline._run_api_inventory("example.com") == []
+    assert pipeline.results["phases"]["api_inventory"]["imported_templates"] == 0
+
+    async def unavailable(*args, **kwargs):
+        return {"status": "skipped", "reason": "browser unavailable", "urls": []}
+
+    monkeypatch.setattr("secagents.pipeline.runner.discover_browser", unavailable)
+    result = await pipeline._run_browser_discovery("example.com")
+    assert result["status"] == "skipped"
+    assert pipeline.results.get("evidence", []) == []
+
+
+@pytest.mark.asyncio
+async def test_api_inventory_records_templates_without_invented_http_proof(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
+    monkeypatch.setattr(
+        "secagents.pipeline.runner.import_har",
+        lambda path: [
+            RequestTemplate("POST", "https://example.com/api", "har", '{"ok":true}')
+        ],
+    )
+    pipeline = ScanPipeline(
+        "https://example.com",
+        har_paths=[tmp_path / "capture.har"],
+        results_dir=tmp_path,
+    )
+    templates = await pipeline._run_api_inventory("example.com")
+    assert templates[0].body == '{"ok":true}'
+    evidence = pipeline.results["evidence"][0]
+    assert evidence["url"] == "https://example.com/api"
+    assert evidence["method"] == "POST"
+    assert evidence["status_code"] is None
+    assert evidence["proof"] is None

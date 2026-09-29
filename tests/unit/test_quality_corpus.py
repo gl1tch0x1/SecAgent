@@ -23,6 +23,18 @@ CASES = (
     ("git_exposed", "/git-negative/.git/config", False),
     ("missing_headers", "/headers-positive", True),
     ("missing_headers", "/headers-negative", False),
+    ("ssti", "/ssti-positive", True),
+    ("ssti", "/ssti-negative", False),
+    ("lfi", "/lfi-positive", True),
+    ("lfi", "/lfi-negative", False),
+    ("env_exposed", "/env-positive/.env", True),
+    ("env_exposed", "/env-negative/.env", False),
+    ("backup_file", "/backup-positive/backup.sql", True),
+    ("backup_file", "/backup-negative/backup.sql", False),
+    ("open_redirect", "/redirect-positive", True),
+    ("open_redirect", "/redirect-negative", False),
+    ("missing_sri", "/sri-positive", True),
+    ("missing_sri", "/sri-negative", False),
 )
 
 
@@ -39,6 +51,44 @@ def _fixture_response(request: httpx.Request) -> httpx.Response:
     if path.endswith("/.git/config"):
         body = (
             "[core]\nrepositoryformatversion = 0" if "git-positive" in path else "safe"
+        )
+        return httpx.Response(200, text=body)
+    if path.startswith("/ssti-"):
+        body = (
+            "evaluated 49"
+            if path.endswith("positive") and request.url.params.get("name") == "{{7*7}}"
+            else "safe"
+        )
+        return httpx.Response(200, text=body)
+    if path.startswith("/lfi-"):
+        body = (
+            "root:x:0:0:root:/root:/bin/bash"
+            if path.endswith("positive")
+            and "passwd" in request.url.params.get("file", "")
+            else "safe"
+        )
+        return httpx.Response(200, text=body)
+    if path.endswith("/.env"):
+        return httpx.Response(
+            200, text="DB_PASSWORD=fixture" if "env-positive" in path else "safe"
+        )
+    if path.endswith("/backup.sql"):
+        return httpx.Response(
+            200, text="CREATE TABLE fixture" if "backup-positive" in path else "safe"
+        )
+    if path.startswith("/redirect-"):
+        location = (
+            f"https://{RUN_CANARY}.com"
+            if path.endswith("positive")
+            and RUN_CANARY in request.url.params.get("redirect", "")
+            else "/safe"
+        )
+        return httpx.Response(302, headers={"Location": location})
+    if path.startswith("/sri-"):
+        body = (
+            '<script src="/app.js"></script>'
+            if path.endswith("positive")
+            else '<script src="/app.js" integrity="sha384-fixture"></script>'
         )
         return httpx.Response(200, text=body)
     if path == "/headers-positive":
@@ -60,7 +110,7 @@ def _fixture_response(request: httpx.Request) -> httpx.Response:
 async def test_http_proof_corpus_precision_recall_and_request_use(monkeypatch):
     monkeypatch.setenv("ALLOWED_DOMAINS", "example.com")
     budget = ExecutionBudget(
-        max_requests=40,
+        max_requests=80,
         requests_per_second_per_host=1000,
         max_concurrency=2,
     )
@@ -74,16 +124,37 @@ async def test_http_proof_corpus_precision_recall_and_request_use(monkeypatch):
     try:
         for key, path, expected in CASES:
             base = "https://example.com" + path
+            path_payloads = {
+                "git_exposed": "/.git/config",
+                "env_exposed": "/.env",
+                "backup_file": "/backup.sql",
+            }
+            param_payloads = {
+                "sqli": ("q", "1'", {}),
+                "ssti": ("name", "{{7*7}}", {"expected": "49"}),
+                "lfi": ("file", "../../etc/passwd", {}),
+                "open_redirect": ("redirect", f"https://{RUN_CANARY}.com", {}),
+            }
+            parameter = param_payloads.get(key)
             candidate = {
                 "url": base,
-                "poc_url": base + "?q=1%27" if key == "sqli" else base,
+                "poc_url": (
+                    base + "?" + str(httpx.QueryParams({parameter[0]: parameter[1]}))
+                    if parameter
+                    else base
+                ),
                 "check_key": key,
                 "request_method": "GET",
                 "payload_spec": (
-                    {"method": "GET", "param": "q", "value": "1'"}
-                    if key == "sqli"
-                    else {"method": "GET_PATH", "path": "/.git/config"}
-                    if key == "git_exposed"
+                    {
+                        "method": "GET",
+                        "param": parameter[0],
+                        "value": parameter[1],
+                        **parameter[2],
+                    }
+                    if parameter
+                    else {"method": "GET_PATH", "path": path_payloads[key]}
+                    if key in path_payloads
                     else {}
                 ),
             }
@@ -96,10 +167,10 @@ async def test_http_proof_corpus_precision_recall_and_request_use(monkeypatch):
     true_positives = sum(a and b for a, b in zip(truth, predicted))
     false_positives = sum(not a and b for a, b in zip(truth, predicted))
     false_negatives = sum(a and not b for a, b in zip(truth, predicted))
-    assert true_positives == 3
+    assert true_positives == 9
     assert false_positives == 0
     assert false_negatives == 0
-    assert budget.snapshot()["requests_used"] <= 14
+    assert budget.snapshot()["requests_used"] <= 40
 
 
 @pytest.mark.asyncio
@@ -319,6 +390,8 @@ async def test_oast_provider_cannot_return_cloud_metadata_callback(monkeypatch):
             await provider.register()
     assert provider.callback_url is None
     assert budget.snapshot()["requests_used"] == 1
+
+
 @pytest.mark.asyncio
 async def test_403_bypass_is_get_only_and_requires_denied_baseline(monkeypatch):
     from secagents.modules.bypass_403 import bypass_403
@@ -328,16 +401,27 @@ async def test_403_bypass_is_get_only_and_requires_denied_baseline(monkeypatch):
 
     def handler(request: httpx.Request) -> httpx.Response:
         methods.append(request.method)
-        if request.url.path == "/protected" and not request.headers.get("X-Forwarded-For"):
+        if request.url.path == "/protected" and not request.headers.get(
+            "X-Forwarded-For"
+        ):
             return httpx.Response(403, text="denied")
         return httpx.Response(200, text="different")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        leads = await bypass_403("https://example.com/protected", "/protected", client=client)
+        leads = await bypass_403(
+            "https://example.com/protected", "/protected", client=client
+        )
     assert leads
     assert all(lead["status_label"] == "manual_lead" for lead in leads)
     assert set(methods) == {"GET"}
 
     methods.clear()
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200))) as client:
-        assert await bypass_403("https://example.com/protected", "/protected", client=client) == []
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    ) as client:
+        assert (
+            await bypass_403(
+                "https://example.com/protected", "/protected", client=client
+            )
+            == []
+        )

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-import xml.etree.ElementTree as ET
 from typing import Any, Dict, List
+
+import defusedxml.ElementTree as ET
 
 
 class ToolOutputParser:

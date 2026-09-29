@@ -20,9 +20,18 @@ from secagents.hermes.retrospective import RetrospectiveAgent
 from secagents.hermes.store import HermesMemory
 from secagents.engine.ci_notifier import CINotifier
 from secagents.infra.scope import enforce_scope, ScopeViolationError
+from secagents.infra.security_policy import SecurityPolicy
 from secagents.infra.execution_budget import ExecutionBudget
 from secagents.infra.request_inventory import import_har, import_openapi
 from secagents.infra.browser_discovery import discover_browser
+from secagents.infra.scan_contracts import (
+    EvidenceRecord,
+    PhaseContract,
+    PhaseResult,
+    ProofArtifact,
+    ScanContext,
+    validate_phase_contract,
+)
 from secagents.intel.shodan_client import ShodanIntel
 from secagents.intel.chaos_client import ChaosIntel
 from secagents.crucible.identity_proof import load_identity_contracts, prove_identity
@@ -71,6 +80,10 @@ class ScanPipeline:
         self.identity_contract_path = identity_contract_path
         self.state_contract_path = state_contract_path
         self.ssrf_contract_path = ssrf_contract_path
+        self.security_policy = SecurityPolicy.from_env(
+            contracted_write=state_contract_path is not None,
+            contracted_ssrf=ssrf_contract_path is not None,
+        )
         if not 0 <= max_payload_variants <= 32 or fuzz_cooldown_seconds < 0:
             raise ValueError("Invalid payload fuzzing limits")
         self.fuzz_payloads = fuzz_payloads
@@ -84,42 +97,117 @@ class ScanPipeline:
         )
         self.results: dict = {"target": target, "phases": {}, "findings": [], "chains": []}
         self.console = Console()
+        self.context = ScanContext(
+            target=target,
+            domain=target if "//" not in target else target.split("//", 1)[1].split("/", 1)[0],
+            depth=depth,
+            workers=workers,
+            results_dir=str(self.results_dir),
+            max_requests=max_requests,
+            requests_per_second_per_host=requests_per_second_per_host,
+            max_duration_seconds=max_duration_seconds,
+            auth_headers=self.auth_headers,
+            api_spec_path=str(api_spec_path) if api_spec_path else None,
+            har_paths=[str(p) for p in (har_paths or [])],
+            identity_contract_path=str(identity_contract_path) if identity_contract_path else None,
+            state_contract_path=str(state_contract_path) if state_contract_path else None,
+            ssrf_contract_path=str(ssrf_contract_path) if ssrf_contract_path else None,
+            fuzz_payloads=fuzz_payloads,
+            max_payload_variants=max_payload_variants,
+            fuzz_cooldown_seconds=fuzz_cooldown_seconds,
+        )
 
-    async def run(self) -> dict:
-        # 0. Scope gate (fail-closed)
+    def _record_phase(
+        self,
+        name: str,
+        payload: dict,
+        evidence: list[EvidenceRecord] | None = None,
+        contract: PhaseContract | None = None,
+    ) -> PhaseResult:
+        result = PhaseResult(name=name, payload=payload, evidence=evidence or [])
+        if contract is not None:
+            validate_phase_contract(result, contract)
+
+        self.results["phases"][name] = payload
+        entries: list[dict] = []
+        if evidence:
+            entries = [
+                {
+                    "phase": e.phase,
+                    "kind": e.kind,
+                    "url": e.url,
+                    "method": e.method,
+                    "status_code": e.status_code,
+                    "payload": e.payload,
+                    "proof_status": e.proof_status,
+                    "metadata": e.metadata,
+                    "proof": {
+                        "kind": e.proof.kind,
+                        "source": e.proof.source,
+                        "url": e.proof.url,
+                        "method": e.proof.method,
+                        "status_code": e.proof.status_code,
+                        "payload": e.proof.payload,
+                        "metadata": e.proof.metadata,
+                    }
+                    if e.proof is not None
+                    else None,
+                }
+                for e in evidence
+            ]
+            self.results.setdefault("evidence", []).extend(entries)
+        return result
+
+    async def _scope_and_preflight(self) -> str:
         try:
+            self.security_policy.validate_target(self.target)
             domain = enforce_scope(self.target)
             self.results["domain"] = domain
         except ScopeViolationError as e:
             self.console.print(f"[bold red]⛔ Scope Violation:[/bold red] {e}")
             raise ScopeViolationError(str(e)) from e
 
-        # 1. Pre-flight
         ok, msg = check_os_security_updates(skip=self.skip_os_check)
         if not ok:
             self.console.print(f"[bold red]CRITICAL:[/bold red] {OS_UPDATE_MESSAGE}")
             raise RuntimeError(OS_UPDATE_MESSAGE)
-        self.results["phases"]["preflight"] = {"os_check": msg}
+        self._record_phase(
+            "preflight",
+            {"os_check": msg},
+            [
+                EvidenceRecord(
+                    phase="preflight",
+                    kind="os_check",
+                    url=self.target,
+                    method="GET",
+                    status_code=None,
+                    payload=None,
+                    proof_status="skipped"
+                    if self.skip_os_check
+                    else "verified"
+                    if ok
+                    else "blocked",
+                    metadata={"message": msg},
+                    proof=ProofArtifact(
+                        kind="os_check",
+                        source="local_runtime",
+                        url=self.target,
+                        method="GET",
+                        status_code=None,
+                        metadata={"message": msg},
+                    ),
+                )
+            ],
+            PhaseContract(
+                name="preflight",
+                required_payload_keys=("os_check",),
+                required_evidence_kinds=("os_check",),
+                required_proof_kinds=("os_check",),
+            ),
+        )
+        return domain
 
-        # 2. Optional local model provisioning. Proof is deterministic and
-        # does not depend on an API key or an LLM opinion.
-        from secagents.core.skill_manager import skill_manager
-
-        if skill_manager.skills:
-            self.console.print(
-                "[bold green]🔥[/bold green] [white]Advanced Hunting Skills loaded from SKILL.md[/white]"
-            )
-
-        if self.setup_local_llm:
-            hw = detect_hardware()
-            self.console.print(f"  [cyan]Hardware:[/cyan] {hw.summary()}")
-            _, ollama_msg = setup_ollama(pull=True)
-            self.console.print(f"  [cyan]whichllm:[/cyan] {ollama_msg}")
-
-        # Fortress is not an isolation boundary for the Python scan path.
-        self.results["phases"]["runtime"] = {"status": "host_execution"}
-
-        # 4. External intel
+    async def _run_external_intel(self, domain: str) -> dict:
         self.console.print(
             "[bold blue]󰋼[/bold blue] [white]Extracting external intelligence...[/white]"
         )
@@ -143,9 +231,33 @@ class ScanPipeline:
                 providers["chaos"] = f"failed: {type(exc).__name__}"
         else:
             providers["chaos"] = "skipped: API key unavailable"
-        self.results["phases"]["external_intel"] = providers
+        self._record_phase(
+            "external_intel",
+            providers,
+            [
+                EvidenceRecord(
+                    phase="external_intel",
+                    kind="intel_provider",
+                    url=domain,
+                    method="GET",
+                    status_code=None,
+                    payload=None,
+                    proof_status="provider_status",
+                    metadata={"providers": providers},
+                    proof=None,
+                )
+            ],
+            PhaseContract(
+                name="external_intel",
+                required_payload_keys=("shodan", "chaos"),
+                required_evidence_kinds=("intel_provider",),
+                allow_empty_evidence=True,
+            ),
+        )
         self.results["intel"] = intel
+        return intel
 
+    async def _run_api_inventory(self, domain: str) -> list:
         templates = []
         if self.api_spec_path:
             templates.extend(
@@ -156,12 +268,36 @@ class ScanPipeline:
             )
         for path in self.har_paths:
             templates.extend(import_har(path))
-        self.results["phases"]["api_inventory"] = {
-            "imported_templates": len(templates),
-            "read_templates_scanned": sum(t.method == "GET" for t in templates),
-            "other_methods_retained_not_sent": sum(t.method != "GET" for t in templates),
-        }
+        self._record_phase(
+            "api_inventory",
+            {
+                "imported_templates": len(templates),
+                "read_templates_eligible": sum(t.method == "GET" for t in templates),
+                "other_methods_retained_not_sent": sum(t.method != "GET" for t in templates),
+            },
+            [
+                EvidenceRecord(
+                    phase="api_inventory",
+                    kind="api_template",
+                    url=t.url,
+                    method=t.method,
+                    status_code=None,
+                    payload=t.url,
+                    proof_status="cataloged",
+                    metadata={"method": t.method, "source": t.source, "has_body": bool(t.body)},
+                    proof=None,
+                )
+                for t in templates[:25]
+            ],
+            PhaseContract(
+                name="api_inventory",
+                required_payload_keys=("imported_templates",),
+                allow_empty_evidence=True,
+            ),
+        )
+        return templates
 
+    async def _run_browser_discovery(self, domain: str) -> dict:
         browser_result = await discover_browser(
             self.target if "://" in self.target else f"https://{domain}/",
             self.budget,
@@ -169,52 +305,122 @@ class ScanPipeline:
             max_pages=5 if self.depth == "quick" else 10 if self.depth == "standard" else 20,
             auth_headers=self.auth_headers,
         )
-        self.results["phases"]["browser_discovery"] = {
+        browser_payload = {
             key: value
             for key, value in browser_result.items()
             if key not in {"urls", "form_templates"}
         }
-        self.results["phases"]["browser_discovery"]["urls_discovered"] = len(
-            browser_result.get("urls", [])
+        browser_payload["urls_discovered"] = len(browser_result.get("urls", []))
+        self._record_phase(
+            "browser_discovery",
+            browser_payload,
+            [
+                EvidenceRecord(
+                    phase="browser_discovery",
+                    kind="page",
+                    url=url,
+                    method="GET",
+                    status_code=None,
+                    payload=None,
+                    proof_status="inventory_candidate",
+                    metadata={"source": "browser"},
+                    proof=None,
+                )
+                for url in browser_result.get("urls", [])[:10]
+            ],
+            PhaseContract(
+                name="browser_discovery",
+                required_payload_keys=("urls_discovered",),
+                allow_empty_evidence=True,
+            ),
         )
+        return browser_result
 
-        # 5. The Armada — execute full DAG
+    async def _run_armada(
+        self,
+        domain: str,
+        intel: dict,
+        templates: list,
+        browser_result: dict,
+        shared: dict | None = None,
+    ):
         self.console.print(
             "[bold blue]󰋼[/bold blue] [white]Deploying agent swarm (The Armada)...[/white]"
         )
-        shared: dict = {
-            "target": domain,
-            "target_url": self.target if "://" in self.target else f"https://{domain}/",
-            "depth": self.depth,
-            "intel": intel,
-            "raw_findings": [],
-            "endpoints": [self.target if "://" in self.target else f"https://{domain}/"]
-            + [t.url for t in templates if t.method == "GET"]
-            + browser_result.get("urls", []),
-            "request_templates": templates,
-            "budget": self.budget,
-            "auth_headers": self.auth_headers,
-            "fuzz_payloads": self.fuzz_payloads,
-            "max_payload_variants": self.max_payload_variants,
-            "fuzz_cooldown_seconds": self.fuzz_cooldown_seconds,
-            "fuzz_memory": AuraMemoryManager.get_instance() if self.fuzz_payloads else None,
-        }
+        if shared is None:
+            shared = {
+                "target": domain,
+                "target_url": self.target if "://" in self.target else f"https://{domain}/",
+                "depth": self.depth,
+                "intel": intel,
+                "raw_findings": [],
+                "endpoints": [self.target if "://" in self.target else f"https://{domain}/"]
+                + [t.url for t in templates if t.method == "GET"]
+                + browser_result.get("urls", []),
+                "request_templates": templates,
+                "budget": self.budget,
+                "auth_headers": self.auth_headers,
+                "fuzz_payloads": self.fuzz_payloads,
+                "max_payload_variants": self.max_payload_variants,
+                "fuzz_cooldown_seconds": self.fuzz_cooldown_seconds,
+                "fuzz_memory": AuraMemoryManager.get_instance() if self.fuzz_payloads else None,
+            }
         armada = ArmadaOrchestrator(workers=self.workers)
         for name, handler in build_scan_handlers(shared).items():
             armada.register_handler(name, handler)
 
         graph = armada.plan_mission(domain, self.depth)
         armada_results = await armada.execute(graph, shared)
-        self.results["phases"]["armada_failures"] = armada_results.get("failures", [])
         raw_findings = list(armada_results.get("findings", [])) or shared.get("raw_findings", [])
-
-        self.results["phases"]["armada"] = {
+        armada_phase = {
             "tasks": len(graph.tasks),
             "task_results": len(armada_results.get("tasks", {})),
             "specialists": [s.name for s in armada.hire_specialists(graph)],
         }
+        self._record_phase(
+            "armada",
+            armada_phase,
+            [
+                EvidenceRecord(
+                    phase="armada",
+                    kind="agent_task",
+                    url=shared["target_url"],
+                    method="GET",
+                    status_code=None,
+                    payload=str(len(graph.tasks)),
+                    proof_status="executed",
+                    metadata={
+                        "task_count": len(graph.tasks),
+                        "specialists": armada_phase["specialists"],
+                    },
+                    proof=ProofArtifact(
+                        kind="agent_task",
+                        source="armada",
+                        url=shared["target_url"],
+                        method="GET",
+                        status_code=None,
+                        payload=str(len(graph.tasks)),
+                        metadata={"task_count": len(graph.tasks)},
+                    ),
+                )
+            ],
+            PhaseContract(
+                name="armada",
+                required_payload_keys=("tasks", "task_results", "specialists"),
+                required_evidence_kinds=("agent_task",),
+                required_proof_kinds=("agent_task",),
+            ),
+        )
+        self.results["phases"]["armada_failures"] = armada_results.get("failures", [])
+        return armada_results, raw_findings
 
-        # Secondary: Arsenal heuristic probes
+    async def _run_arsenal(
+        self,
+        domain: str,
+        armada_results: dict,
+        raw_findings: list,
+        shared: dict | None = None,
+    ):
         if self.arsenal_secondary and not armada_results.get("failures"):
             self.console.print(
                 "[bold blue]󰋼[/bold blue] [white]Engaging secondary heuristic probes (The Arsenal)...[/white]"
@@ -224,7 +430,15 @@ class ScanPipeline:
                 budget=self.budget,
                 auth_headers=self.auth_headers,
             )
-            endpoints = shared.get("endpoints") or [f"https://{domain}"]
+            endpoints = (
+                (shared or {}).get("endpoints")
+                if isinstance(shared, dict)
+                else armada_results.get("shared", {}).get("endpoints")
+                if isinstance(armada_results.get("shared"), dict)
+                else None
+            )
+            if endpoints is None:
+                endpoints = [f"https://{domain}"]
             limit = 25 if self.depth == "quick" else 50 if self.depth == "standard" else 100
             for url in endpoints[:limit]:
                 for p in await scanner.scan_url(url):
@@ -244,6 +458,81 @@ class ScanPipeline:
                             "deterministic": False,
                         }
                     )
+        return raw_findings
+
+    async def run(self) -> dict:
+        domain = await self._scope_and_preflight()
+
+        from secagents.core.skill_manager import skill_manager
+
+        if skill_manager.skills:
+            self.console.print(
+                "[bold green]🔥[/bold green] [white]Advanced Hunting Skills loaded from SKILL.md[/white]"
+            )
+
+        if self.setup_local_llm:
+            hw = detect_hardware()
+            self.console.print(f"  [cyan]Hardware:[/cyan] {hw.summary()}")
+            _, ollama_msg = setup_ollama(pull=True)
+            self.console.print(f"  [cyan]whichllm:[/cyan] {ollama_msg}")
+
+        self._record_phase(
+            "runtime",
+            {"status": "host_execution"},
+            [
+                EvidenceRecord(
+                    phase="runtime",
+                    kind="runtime_context",
+                    url=self.target,
+                    method="GET",
+                    status_code=None,
+                    payload="host_execution",
+                    proof_status="verified",
+                    metadata={"execution": "local_host"},
+                    proof=ProofArtifact(
+                        kind="runtime_context",
+                        source="host_runtime",
+                        url=self.target,
+                        method="GET",
+                        status_code=None,
+                        payload="host_execution",
+                        metadata={"execution": "local_host"},
+                    ),
+                )
+            ],
+            PhaseContract(
+                name="runtime",
+                required_payload_keys=("status",),
+                required_evidence_kinds=("runtime_context",),
+                required_proof_kinds=("runtime_context",),
+            ),
+        )
+
+        intel = await self._run_external_intel(domain)
+        templates = await self._run_api_inventory(domain)
+        browser_result = await self._run_browser_discovery(domain)
+
+        shared: dict = {
+            "target": domain,
+            "target_url": self.target if "://" in self.target else f"https://{domain}/",
+            "depth": self.depth,
+            "intel": intel,
+            "raw_findings": [],
+            "endpoints": [self.target if "://" in self.target else f"https://{domain}/"]
+            + [t.url for t in templates if t.method == "GET"]
+            + browser_result.get("urls", []),
+            "request_templates": templates,
+            "budget": self.budget,
+            "auth_headers": self.auth_headers,
+            "fuzz_payloads": self.fuzz_payloads,
+            "max_payload_variants": self.max_payload_variants,
+            "fuzz_cooldown_seconds": self.fuzz_cooldown_seconds,
+            "fuzz_memory": AuraMemoryManager.get_instance() if self.fuzz_payloads else None,
+        }
+        armada_results, raw_findings = await self._run_armada(
+            domain, intel, templates, browser_result, shared
+        )
+        raw_findings = await self._run_arsenal(domain, armada_results, raw_findings, shared)
 
         # Deduplicate
         seen: set[str] = set()
@@ -311,7 +600,11 @@ class ScanPipeline:
             )
             for state_contract in state_contracts:
                 try:
-                    outcomes.append(await observe_state_contract(state_contract, self.budget))
+                    outcomes.append(
+                        await observe_state_contract(
+                            state_contract, self.budget, policy=self.security_policy
+                        )
+                    )
                 except Exception as exc:
                     outcomes.append(
                         {
@@ -334,7 +627,12 @@ class ScanPipeline:
             for ssrf_contract in ssrf_contracts:
                 try:
                     outcomes.append(
-                        await prove_ssrf(ssrf_contract, self.budget, auth_headers=self.auth_headers)
+                        await prove_ssrf(
+                            ssrf_contract,
+                            self.budget,
+                            auth_headers=self.auth_headers,
+                            policy=self.security_policy,
+                        )
                     )
                 except Exception as exc:
                     outcomes.append(

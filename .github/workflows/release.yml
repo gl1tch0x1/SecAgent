@@ -200,7 +200,9 @@ jobs:
       - name: Smoke test packaged CLI artifact
         shell: bash
         run: |
-          python scripts/release_smoke.py --binary "dist/${{ matrix.asset_name }}" --args --help
+          python scripts/release_smoke.py \
+            --binary "dist/${{ matrix.asset_name }}" \
+            --expected-version "${{ needs.validate-release.outputs.version }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -215,7 +217,7 @@ jobs:
   build-docker:
     name: "Build & Push Docker Images"
     runs-on: ubuntu-latest
-    needs: [validate-release, test]
+    needs: [validate-release, test, build-binaries]
     permissions:
       contents: read
       packages: write

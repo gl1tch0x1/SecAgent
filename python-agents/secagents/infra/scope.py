@@ -37,8 +37,8 @@ class ScopePolicy:
 
         if not self.allowed_domains:
             raise ScopeViolationError(
-                "ALLOWED_DOMAINS is not configured. Set it in .env before scanning "
-                "(e.g. ALLOWED_DOMAINS=example.com,*.example.com)"
+                "No authorized target scope is configured. Run 'secagent scope --add DOMAIN' "
+                "or pass --authorize-targets for this scan."
             )
 
         for allowed in self.allowed_domains:
@@ -46,7 +46,8 @@ class ScopePolicy:
                 return
 
         raise ScopeViolationError(
-            f"Target '{domain}' is not in ALLOWED_DOMAINS: {', '.join(self.allowed_domains)}"
+            f"Target '{domain}' is outside the authorized scope ({', '.join(self.allowed_domains)}). "
+            f"Run 'secagent scope --add {domain}' or pass --authorize-targets for this scan."
         )
 
 
