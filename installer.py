@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import getpass
 import ipaddress
 from importlib.util import find_spec
@@ -45,10 +46,11 @@ if not bootstrap_rich():
 
 from rich.console import Console
 from rich.console import Group
-from rich.columns import Columns
+from rich.align import Align
 from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
+from rich.spinner import Spinner
 from rich.text import Text
 from rich.theme import Theme
 from rich.box import ROUNDED, HEAVY
@@ -98,59 +100,120 @@ BANNER = r"""
 """
 
 
-def get_header():
-    title = Text(BANNER, style="hacker")
+def get_header(width: int | None = None):
+    title = Text(BANNER.strip("\n"), style="hacker")
     subtitle = Text(
         "// OFFENSIVE TOOLCHAIN ARMING SEQUENCE // AUTHORIZED TARGETS ONLY",
         style="bold cyan",
     )
     return Panel(
-        Group(title, subtitle), border_style="green", box=HEAVY, padding=(0, 1)
+        Group(title, subtitle),
+        border_style="green",
+        box=HEAVY,
+        padding=(0, 1),
+        width=width,
     )
 
 
 class DeploymentUI:
     def __init__(self):
         self.phases: list[tuple[str, str]] = []
-        self.log_messages: list[str] = []
+        self.log_messages: list[tuple[str, str, str]] = []
         self.active_phase = "BOOTSTRAP"
+        self.started_at = time.monotonic()
+
+    def reset(self):
+        self.phases.clear()
+        self.log_messages.clear()
+        self.active_phase = "BOOTSTRAP"
+        self.started_at = time.monotonic()
 
     def update_log(self, message: str, style: str = "info"):
         timestamp = time.strftime("%H:%M:%S")
-        prefixes = {"info": "[>]", "success": "[+]", "warning": "[!]", "error": "[x]"}
-        self.log_messages.append(f"{timestamp} {prefixes.get(style, '[>]')} {message}")
-        if len(self.log_messages) > 9:
+        self.log_messages.append((timestamp, style, message))
+        if len(self.log_messages) > 12:
             self.log_messages.pop(0)
+        if not console.is_terminal:
+            console.print(f"{timestamp}  {style.upper():7}  {message}", markup=False)
 
-    def add_phase(self, name: str, status: str = "[dim]PENDING[/dim]"):
+    def add_phase(self, name: str, status: str = "pending"):
         self.phases.append((name, status))
 
     def update_phase(self, index: int, status: str):
         self.phases[index] = (self.phases[index][0], status)
 
+    def __rich_console__(self, _console, _options):
+        yield self.render()
+
     def render(self):
-        phases = Table(
-            title="[bold magenta]MISSION LOADOUT[/bold magenta]", box=ROUNDED
-        )
+        width = min(getattr(console, "width", 100), 102)
+        compact = width < 86
+        phases = Table(box=None, show_header=True, padding=(0, 1), expand=True)
         phases.add_column("#", width=3, style="dim")
-        phases.add_column("MODULE", min_width=15)
-        phases.add_column("STATE", justify="right", min_width=11)
+        phases.add_column("PHASE", style="bold white")
+        phases.add_column("STATE", justify="right", min_width=10)
+        complete = 0
         for index, (name, status) in enumerate(self.phases, 1):
-            phases.add_row(f"{index:02d}", name, status)
-        telemetry = Panel(
-            "\n".join(self.log_messages) or "Awaiting installer events",
-            title="[bold cyan]SIGNAL FEED[/bold cyan]",
+            if status == "success":
+                complete += 1
+            state = {
+                "pending": Text("QUEUED", style="dim"),
+                "active": Spinner("line", text="RUNNING", style="info"),
+                "success": Text("READY", style="success"),
+                "failed": Text("FAILED", style="error"),
+            }.get(status, Text(status, style="warning"))
+            phases.add_row(f"{index:02d}", name, state)
+        feed = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+        feed.add_column("TIME", width=8, style="dim", no_wrap=True)
+        feed.add_column("", width=2, no_wrap=True)
+        feed.add_column("EVENT", overflow="fold")
+        symbols = {"info": ">", "success": "+", "warning": "!", "error": "x"}
+        for stamp, style, message in self.log_messages[-(7 if compact else 10) :]:
+            feed.add_row(
+                stamp, Text(symbols.get(style, ">"), style=style), Text(message)
+            )
+        if not self.log_messages:
+            feed.add_row("--:--:--", Text(">", style="info"), "Awaiting events")
+
+        phase_width = 42 if width >= 96 else 40
+        phase_panel = Panel(
+            phases,
+            title="[phase]01 / DEPLOYMENT PHASES[/phase]",
+            border_style="bright_black",
+            padding=(0, 1),
+            width=width if compact else phase_width,
+        )
+        feed_panel = Panel(
+            feed,
+            title="[info]02 / EXECUTION LOG[/info]",
             border_style="cyan",
-            height=max(5, min(12, len(self.log_messages) + 3)),
+            padding=(0, 1),
+            width=width if compact else width - phase_width,
         )
-        return Group(
-            get_header(),
-            Columns([phases, telemetry], expand=True, equal=False),
-            Panel(
-                f"[bold white]ACTIVE MODULE[/bold white]  {self.active_phase}",
-                border_style="magenta",
-            ),
+        if compact:
+            body = Group(phase_panel, feed_panel)
+        else:
+            grid = Table.grid(padding=0)
+            grid.add_column()
+            grid.add_column()
+            grid.add_row(phase_panel, feed_panel)
+            body = grid
+        elapsed = int(time.monotonic() - self.started_at)
+        footer = Text()
+        footer.append(f"  {complete:02d}/{len(self.phases):02d} READY", style="success")
+        footer.append(f"    ACTIVE  {self.active_phase}", style="bold white")
+        footer.append(
+            f"    ELAPSED  {elapsed // 60:02d}:{elapsed % 60:02d}", style="dim"
         )
+        content = Group(
+            get_header(width)
+            if width >= 76
+            else Panel("SecAgents // INSTALL", border_style="green", width=width),
+            Text("  SECAGENT  /  INSTALLATION CONSOLE", style="bold white"),
+            body,
+            Panel(footer, border_style="magenta", padding=(0, 0), width=width),
+        )
+        return Align.center(content, vertical="top", width=width)
 
 
 ui = DeploymentUI()
@@ -195,24 +258,26 @@ def run_preflight(args: argparse.Namespace) -> bool:
 
 
 def deploy_environment() -> bool:
-    ui.update_log("Hardening execution environment...")
+    ui.update_log("Preparing isolated Python environment...")
     if not VENV_DIR.exists():
         try:
             result = run_cmd([sys.executable, "-m", "venv", str(VENV_DIR)], timeout=180)
             if result.returncode != 0:
                 ui.update_log(
-                    f"Environment setup failed: {result.stderr[-160:]}", "error"
+                    f"Environment setup failed (exit {result.returncode}).", "error"
                 )
                 return False
-            ui.update_log("Isolated tunnel (venv) established.", "success")
+            ui.update_log(f"Virtual environment created at {VENV_DIR.name}.", "success")
         except Exception as e:
             ui.update_log(f"Environment collapse: {e}", "error")
             return False
+    else:
+        ui.update_log(f"Existing {VENV_DIR.name} environment reused.", "success")
     return True
 
 
 def install_arsenal(args: argparse.Namespace) -> bool:
-    ui.update_log("Arming the offensive arsenal...")
+    ui.update_log("Installing Python agents and browser support...")
 
     packages = [
         ("Core Agents Framework", PYTHON_AGENTS, ".[dev,browser]"),
@@ -221,11 +286,14 @@ def install_arsenal(args: argparse.Namespace) -> bool:
         if not path.exists():
             ui.update_log(f"Required package path missing: {path}", "error")
             return False
-        ui.update_log(f"Mounting {name}...")
+        ui.update_log(
+            f"Installing {name}; dependency resolution may take a few minutes..."
+        )
         res = run_cmd([PIP_EXEC, "install", "--prefer-binary", "-e", extras], cwd=path)
         if res.returncode != 0:
-            ui.update_log(f"{name} mount failed: {res.stderr[-160:]}", "error")
+            ui.update_log(f"{name} install failed (exit {res.returncode}).", "error")
             return False
+        ui.update_log(f"{name} installed.", "success")
     return True
 
 
@@ -473,7 +541,7 @@ def configure_llm_interactive() -> bool:
 
 
 def create_entrypoints() -> bool:
-    ui.update_log("Deploying operational entrypoints...")
+    ui.update_log("Creating the secagent command entrypoint...")
     if IS_WIN:
         (ROOT / "secagent.bat").write_text(
             f'@echo off\r\n"{PYTHON_EXEC}" -m secagents %*\r\n', encoding="utf-8"
@@ -502,6 +570,7 @@ def create_entrypoints() -> bool:
                     break
                 except OSError as err:
                     ui.update_log(f"Could not link to {target_dir}: {err}", "warning")
+    ui.update_log("Local CLI entrypoint is ready.", "success")
     return True
 
 
@@ -511,45 +580,71 @@ def run_tests() -> bool:
     if res.returncode == 0:
         ui.update_log("CLI command verified.", "success")
         return True
-    ui.update_log(f"CLI verification failed: {res.stderr[-160:]}", "error")
+    ui.update_log(f"CLI verification failed (exit {res.returncode}).", "error")
     return False
 
 
 def print_final_report(success: bool, verified: bool = True):
-    console.print("\n" + "━" * 70, style="phase")
-    if success:
-        console.print(
+    width = min(getattr(console, "width", 100), 102)
+    elapsed = int(time.monotonic() - ui.started_at)
+    title = Text(
+        "INSTALL COMPLETE  /  CLI VERIFIED"
+        if success and verified
+        else "INSTALL COMPLETE  /  CLI CHECK SKIPPED"
+        if success
+        else "INSTALL FAILED  /  REVIEW THE EVENT LOG",
+        style="success" if success else "error",
+    )
+    summary = Table(box=None, show_header=False, expand=True, padding=(0, 1))
+    summary.add_column("PHASE", style="bold white")
+    summary.add_column("RESULT", justify="right")
+    for name, state in ui.phases:
+        label = "READY" if state == "success" else state.upper()
+        color = (
+            "success" if state == "success" else "error" if state == "failed" else "dim"
+        )
+        summary.add_row(name, Text(label, style=color))
+    summary.add_row("ELAPSED", f"{elapsed // 60:02d}:{elapsed % 60:02d}")
+
+    event_log = Table(box=None, show_header=False, expand=True, padding=(0, 1))
+    event_log.add_column("TIME", width=8, style="dim", no_wrap=True)
+    event_log.add_column("EVENT", overflow="fold")
+    for stamp, style, message in ui.log_messages[-5:]:
+        event_log.add_row(stamp, Text(message, style=style))
+
+    sections: list = [
+        get_header(width)
+        if width >= 76
+        else Panel("SecAgents // INSTALL", border_style="green", width=width),
+        Panel(
+            title,
+            border_style="success" if success else "error",
+            box=HEAVY,
+            width=width,
+        ),
+        Panel(
+            summary,
+            title="[phase]DEPLOYMENT SUMMARY[/phase]",
+            border_style="bright_black",
+            width=width,
+        ),
+    ]
+    if ui.log_messages:
+        sections.append(
             Panel(
-                Text(
-                    "INSTALL COMPLETE // CLI VERIFIED"
-                    if verified
-                    else "INSTALL COMPLETE // CLI CHECK SKIPPED",
-                    style="success",
-                    justify="center",
-                ),
-                border_style="success",
-                box=HEAVY,
+                event_log,
+                title="[info]RECENT EVENTS[/info]",
+                border_style="cyan",
+                width=width,
             )
         )
-    else:
-        console.print(
-            Panel(
-                Text(
-                    "INSTALL FAILED // REVIEW THE SIGNAL FEED",
-                    style="error",
-                    justify="center",
-                ),
-                border_style="error",
-                box=HEAVY,
-            )
-        )
-        for message in ui.log_messages[-5:]:
-            console.print(message)
+    if not success:
+        console.print(Align.center(Group(*sections), vertical="top", width=width))
         return
 
-    table = Table(box=None, expand=True)
-    table.add_column("COMMAND", style="cyan", width=25)
-    table.add_column("DESCRIPTION", style="dim")
+    table = Table(box=None, expand=True, padding=(0, 1))
+    table.add_column("COMMAND", style="cyan", no_wrap=False)
+    table.add_column("PURPOSE", style="white")
 
     cli = ".\\secagent.bat" if IS_WIN else "./secagent"
     configured = ""
@@ -571,13 +666,18 @@ def print_final_report(success: bool, verified: bool = True):
     )
     table.add_row(f"{cli} --help", "Show every supported command and option")
 
-    console.print(table)
-    console.print("━" * 70, style="phase")
-    console.print(
-        "Operator scope is required. Installation never authorizes a target for you.",
-        style="dim",
-        justify="center",
+    sections.append(
+        Panel(
+            table, title="[info]FIRST COMMANDS[/info]", border_style="cyan", width=width
+        )
     )
+    sections.append(
+        Text(
+            "Operator authorization controls target scope. Use only domains you may assess.",
+            style="dim",
+        )
+    )
+    console.print(Align.center(Group(*sections), vertical="top", width=width))
 
 
 def main():
@@ -599,6 +699,7 @@ def main():
         help="Explicit comma-separated target domains to authorize in .env",
     )
     args = parser.parse_args()
+    ui.reset()
 
     phases = [
         ("PREFLIGHT", lambda: run_preflight(args)),
@@ -611,32 +712,43 @@ def main():
         phases.append(("INTEGRITY", run_tests))
 
     for name, _ in phases:
-        ui.add_phase(name)
+        ui.add_phase(name, "pending")
+    ui.update_log("Installer initialized; checking the local toolchain.")
 
     overall_success = True
 
-    with Live(
-        ui.render(), console=console, refresh_per_second=4, screen=console.is_terminal
-    ) as live:
+    live_display = (
+        Live(ui, console=console, refresh_per_second=4, screen=True)
+        if console.is_terminal
+        else nullcontext(None)
+    )
+    with live_display as live:
         for i, (name, func) in enumerate(phases):
-            ui.update_phase(i, "[yellow]ACTIVE[/yellow]")
+            ui.update_phase(i, "active")
             ui.active_phase = name
-            live.update(ui.render())
+            ui.update_log(f"Starting {name.lower()} phase.")
+            if live is not None:
+                live.update(ui)
 
             try:
                 if func():
-                    ui.update_phase(i, "[green]SUCCESS[/green]")
+                    ui.update_phase(i, "success")
+                    ui.update_log(f"{name.title()} phase complete.", "success")
                 else:
-                    ui.update_phase(i, "[red]FAILED[/red]")
+                    ui.update_phase(i, "failed")
+                    ui.update_log(
+                        f"{name.title()} phase failed; installation stopped.", "error"
+                    )
                     overall_success = False
                     break
             except Exception as e:
                 ui.update_log(f"Phase {name} crash: {e}", "error")
-                ui.update_phase(i, "[bold red]CRASH[/red]")
+                ui.update_phase(i, "failed")
                 overall_success = False
                 break
 
-            live.update(ui.render())
+            if live is not None:
+                live.update(ui)
             if console.is_terminal:
                 time.sleep(0.12)
 

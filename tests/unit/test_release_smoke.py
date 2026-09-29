@@ -650,6 +650,78 @@ def test_reinstall_with_saved_llm_does_not_ask_for_key(tmp_path, monkeypatch):
     assert installer.main() == 0
 
 
+@pytest.mark.parametrize("terminal_width", [72, 100, 160])
+def test_installer_live_layout_is_bounded_and_preserves_banner(
+    terminal_width, monkeypatch
+):
+    import io
+
+    import installer
+    from rich.console import Console
+
+    output = io.StringIO()
+    monkeypatch.setattr(
+        installer,
+        "console",
+        Console(file=output, force_terminal=False, width=terminal_width),
+    )
+    display = installer.DeploymentUI()
+    for name in ("PREFLIGHT", "ENVIRONMENT", "ARSENAL", "SCOPE"):
+        display.add_phase(name)
+    display.update_phase(0, "success")
+    display.update_phase(1, "active")
+    display.active_phase = "ENVIRONMENT"
+    display.update_log("Virtual environment is ready.", "success")
+    installer.console.print(display.render())
+    rendered = output.getvalue()
+    assert "_____           ___                    __" in (
+        rendered if terminal_width >= 76 else installer.BANNER
+    )
+    assert "ENVIRONMENT" in rendered
+    assert "Virtual environment is ready." in rendered
+    assert all(len(line) <= terminal_width for line in rendered.splitlines())
+
+
+def test_installer_completion_shows_verified_commands_without_api_key(
+    tmp_path, monkeypatch
+):
+    import io
+
+    import installer
+    from rich.console import Console
+
+    output = io.StringIO()
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "ALLOWED_DOMAINS=app.example\nOPENAI_API_KEY=private-test-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer, "ENV_FILE", env_file)
+    monkeypatch.setattr(
+        installer,
+        "console",
+        Console(
+            file=output,
+            force_terminal=False,
+            width=100,
+            theme=installer.custom_theme,
+        ),
+    )
+    display = installer.DeploymentUI()
+    display.add_phase("PREFLIGHT", "success")
+    display.add_phase("INTEGRITY", "success")
+    display.update_log("CLI command verified.", "success")
+    monkeypatch.setattr(installer, "ui", display)
+
+    installer.print_final_report(True)
+    rendered = output.getvalue()
+    assert "INSTALL COMPLETE" in rendered
+    assert "DEPLOYMENT SUMMARY" in rendered
+    assert "FIRST COMMANDS" in rendered
+    assert "app.example" in rendered
+    assert "private-test-key" not in rendered
+
+
 def test_role_prompts_include_new_hunting_skills_without_full_global_guide():
     from secagents.core.skill_manager import skill_manager
 
