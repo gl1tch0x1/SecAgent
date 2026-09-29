@@ -1,9 +1,10 @@
-"""Module 2: Omni-LLM — provider-agnostic client with auto-detection."""
+"""Module 2: Omni-LLM — provider-aware client with explicit routing."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -28,12 +29,13 @@ class LLMResponse:
 DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "openai_compatible": "gpt-4o-mini",
-    "anthropic": "claude-3-5-sonnet-20241022",
+    "anthropic": "claude-sonnet-5",
+    "deepseek": "deepseek-flash",
     "groq": "llama-3.1-70b-versatile",
-    "google": "gemini-1.5-flash",
+    "google": "gemini-3.8-flash",
     "openrouter": "openai/gpt-4o-mini",
     "xai": "grok-beta",
-    "ollama": "llama3",
+    "ollama": "llama3.2:3b",
 }
 
 
@@ -43,12 +45,14 @@ class ProviderConfig:
     api_key: str
     base_url: str | None = None
     model: str | None = None
+    endpoint: str | None = None
+    display_name: str | None = None
 
 
 class OmniLLM:
     """
-    Universal LLM client. No --llm-provider flag required.
-    Detects provider from key prefix; supports multiple keys for consensus.
+    Universal LLM client with an explicit primary provider and optional fallback keys.
+    Legacy bulk keys still use prefix detection when no named key identifies them.
     """
 
     def __init__(self, providers: list[ProviderConfig] | None = None):
@@ -57,23 +61,81 @@ class OmniLLM:
 
     def _discover_providers(self) -> list[ProviderConfig]:
         configs: list[ProviderConfig] = []
+        named_keys = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+            "google": "GEMINI_API_KEY",
+            "groq": "GROQ_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "xai": "XAI_API_KEY",
+        }
+        selected = os.environ.get("SECAGENT_LLM_PROVIDER", "").strip().lower()
+        configured_model = os.environ.get("SECAGENT_LLM_MODEL", "").strip() or None
+        if selected:
+            if selected == "ollama":
+                configs.append(
+                    ProviderConfig(
+                        name="ollama",
+                        api_key=os.environ.get("SECAGENT_LLM_API_KEY", "").strip(),
+                        base_url=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
+                        model=configured_model or os.environ.get("OLLAMA_MODEL") or None,
+                    )
+                )
+            elif selected == "custom":
+                endpoint = os.environ.get("SECAGENT_LLM_ENDPOINT", "").strip()
+                key = os.environ.get("SECAGENT_LLM_API_KEY", "").strip()
+                if not key or not configured_model or not endpoint:
+                    raise ValueError("Custom LLM needs API key, model ID, and endpoint")
+                try:
+                    parsed = urlsplit(endpoint)
+                    port = parsed.port
+                except ValueError as exc:
+                    raise ValueError("Custom LLM endpoint URL is invalid") from exc
+                if parsed.username or parsed.password:
+                    raise ValueError("Custom LLM endpoint cannot contain credentials")
+                if port is not None and not 1 <= port <= 65535:
+                    raise ValueError("Custom LLM endpoint port is invalid")
+                if parsed.scheme != "https" and not (
+                    parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                ):
+                    raise ValueError("Custom LLM endpoint must use HTTPS or local loopback HTTP")
+                if (
+                    not parsed.hostname
+                    or not parsed.path.strip("/")
+                    or parsed.query
+                    or parsed.fragment
+                ):
+                    raise ValueError(
+                        "Custom LLM endpoint must be a full route without query or fragment"
+                    )
+                configs.append(
+                    ProviderConfig(
+                        name="custom",
+                        api_key=key,
+                        model=configured_model,
+                        endpoint=endpoint,
+                        display_name=os.environ.get("SECAGENT_LLM_NAME", "").strip() or "custom",
+                    )
+                )
+            elif selected in named_keys:
+                key = os.environ.get(named_keys[selected], "").strip()
+                if not key:
+                    raise ValueError(
+                        f"{named_keys[selected]} is missing for the selected LLM provider"
+                    )
+                configs.append(ProviderConfig(name=selected, api_key=key, model=configured_model))
+            else:
+                raise ValueError(f"Unsupported SECAGENT_LLM_PROVIDER: {selected}")
+
         bulk = os.environ.get("LLM_API_KEYS", "")
-        keys: list[str] = [k.strip() for k in bulk.split(",") if k.strip()] if bulk else []
-        if not keys:
-            for env in (
-                "OPENAI_API_KEY",
-                "ANTHROPIC_API_KEY",
-                "GROQ_API_KEY",
-                "DEEPSEEK_API_KEY",
-                "GEMINI_API_KEY",
-                "OPENROUTER_API_KEY",
-            ):
-                val = os.environ.get(env, "").strip()
-                if val:
-                    keys.append(val)
-        for key in keys:
-            name = detect_provider_from_key(key)
-            configs.append(ProviderConfig(name=name, api_key=key))
+        for name, env in named_keys.items():
+            key = os.environ.get(env, "").strip()
+            if key and not any(p.name == name and p.api_key == key for p in configs):
+                configs.append(ProviderConfig(name=name, api_key=key))
+        for key in (item.strip() for item in bulk.split(",")):
+            if key and not any(p.api_key == key for p in configs):
+                configs.append(ProviderConfig(name=detect_provider_from_key(key), api_key=key))
         # Local Ollama fallback — only if OLLAMA_HOST is explicitly set
         if not configs:
             ollama_host = os.environ.get("OLLAMA_HOST", "").strip()
@@ -93,7 +155,7 @@ class OmniLLM:
         cfg = self._select_provider(provider)
         if not cfg:
             raise RuntimeError(
-                "No LLM provider configured. Set LLM_API_KEYS or OPENAI_API_KEY in .env"
+                "No LLM provider configured. Run the installer LLM setup or configure .env"
             )
 
         await get_rate_limiter().check(cfg.name)
@@ -113,6 +175,14 @@ class OmniLLM:
             return await self._openai_compatible(
                 cfg, messages, model, max_tokens, "https://openrouter.ai/api/v1"
             )
+        if cfg.name == "deepseek":
+            return await self._openai_compatible(
+                cfg, messages, model, max_tokens, "https://api.deepseek.com"
+            )
+        if cfg.name == "xai":
+            return await self._openai_compatible(
+                cfg, messages, model, max_tokens, "https://api.x.ai/v1"
+            )
         base = cfg.base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
         return await self._openai_compatible(cfg, messages, model, max_tokens, base)
 
@@ -121,8 +191,9 @@ class OmniLLM:
             return None
         if name:
             for p in self.providers:
-                if p.name == name:
+                if p.name == name or p.display_name == name:
                     return p
+            raise ValueError(f"LLM provider is not configured: {name}")
         return self.providers[0]
 
     async def _openai_compatible(
@@ -133,11 +204,16 @@ class OmniLLM:
         max_tokens: int,
         base_url: str,
     ) -> LLMResponse:
-        url = f"{base_url.rstrip('/')}/chat/completions"
+        url = cfg.endpoint or f"{base_url.rstrip('/')}/chat/completions"
+        token_field = (
+            "max_completion_tokens"
+            if cfg.name == "openai" and urlsplit(url).hostname == "api.openai.com"
+            else "max_tokens"
+        )
         payload = {
             "model": model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "max_tokens": max_tokens,
+            token_field: max_tokens,
         }
         resp = await self._client.post(
             url,
@@ -150,7 +226,7 @@ class OmniLLM:
         usage = data.get("usage", {})
         return LLMResponse(
             content=content,
-            provider=cfg.name,
+            provider=cfg.display_name or cfg.name,
             model=model,
             tokens_used=usage.get("total_tokens", 0),
         )
@@ -193,17 +269,26 @@ class OmniLLM:
         model: str,
         max_tokens: int,
     ) -> LLMResponse:
-        text = "\n".join(f"{m.role}: {m.content}" for m in messages)
+        system = "\n".join(m.content for m in messages if m.role == "system")
+        contents = [
+            {"role": "model" if m.role == "assistant" else "user", "parts": [{"text": m.content}]}
+            for m in messages
+            if m.role != "system"
+        ]
         url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={cfg.api_key}"
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{quote(model, safe='-._')}:generateContent"
         )
+        body: dict = {
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": max_tokens},
+        }
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
         resp = await self._client.post(
             url,
-            json={
-                "contents": [{"parts": [{"text": text}]}],
-                "generationConfig": {"maxOutputTokens": max_tokens},
-            },
+            json=body,
+            headers={"x-goog-api-key": cfg.api_key},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -226,6 +311,7 @@ class OmniLLM:
                 "stream": False,
                 "options": {"num_predict": max_tokens},
             },
+            headers={"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else None,
         )
         resp.raise_for_status()
         data = resp.json()

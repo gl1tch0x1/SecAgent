@@ -400,6 +400,8 @@ python installer.py --allowed-domains app.example
 
 The installer uses a compact live terminal display and clears it before showing the final command list. It creates `.env` without authorizing a target by default. Use `--allowed-domains` during setup or `./secagent scope --add DOMAIN` afterward; scans remain blocked until the target is explicitly allowed. On Windows, use `.\secagent.bat` in place of `./secagent`. Run `./secagent --help` to verify the entrypoint.
 
+In an interactive terminal, installation asks **Yes / Skip** for LLM setup. Yes offers OpenAI, Claude, DeepSeek, Gemini, Ollama, and Other. Enter the provider's model ID; cloud keys are entered without terminal echo. Ollama uses a local host and does not require a key. Other expects an OpenAI-compatible chat-completions endpoint URL (including its route), model ID, provider name, and Bearer API key. Remote endpoints must use HTTPS; loopback HTTP is allowed. The installer saves the selected primary provider in the ignored local `.env` with owner-only permissions on Unix. It does not send a test prompt or validate a paid key during installation. For automated installs, use `python installer.py --skip-llm-setup`.
+
 ### Method 2 — Manual Package Installation
 
 For developer control or integration into existing Python environments:
@@ -470,6 +472,8 @@ Operational parameters and API credentials are read from `.env`:
 
 ```env
 # ─── Primary LLM Provider Keys ───
+SECAGENT_LLM_PROVIDER=openai
+SECAGENT_LLM_MODEL=gpt-4o-mini
 OPENAI_API_KEY=sk-proj-...
 ANTHROPIC_API_KEY=sk-ant-...
 GEMINI_API_KEY=AIzaSy...
@@ -478,7 +482,7 @@ DEEPSEEK_API_KEY=sk-...
 
 # ─── Local LLM Configuration ───
 OLLAMA_HOST=http://localhost:11434
-DEFAULT_LOCAL_MODEL=llama3:8b
+OLLAMA_MODEL=llama3.2:3b
 
 # ─── Operational Scope & Infrastructure ───
 ALLOWED_DOMAINS=example.com,target.local
@@ -486,6 +490,8 @@ REDIS_URL=redis://localhost:6379/0
 RESULTS_DIR=cog-ai-results
 SECAGENT_VERIFY_SSL=true
 ```
+
+Set `SECAGENT_LLM_PROVIDER` to `openai`, `anthropic` (Claude), `deepseek`, `google` (Gemini), `ollama`, or `custom`. For a custom OpenAI-compatible service, set `SECAGENT_LLM_PROVIDER=custom`, `SECAGENT_LLM_NAME`, `SECAGENT_LLM_MODEL`, `SECAGENT_LLM_API_KEY`, and `SECAGENT_LLM_ENDPOINT=https://your-host/v1/chat/completions`. SecAgent sends the custom key as a Bearer token. The CLI reads `.env` in the current directory first, then the installation directory; `SECAGENT_ENV_FILE` can select a specific file. Keep API keys out of committed files and command-line arguments.
 
 ---
 

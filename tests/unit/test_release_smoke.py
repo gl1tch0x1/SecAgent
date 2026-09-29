@@ -318,7 +318,9 @@ def test_updater_treats_local_ahead_as_no_inbound_update(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_health_endpoint_reports_degraded_without_inventing_readiness(monkeypatch):
+async def test_health_endpoint_reports_degraded_without_inventing_readiness(
+    monkeypatch,
+):
     from secagents.infra import health_checks
 
     async def degraded():
@@ -340,3 +342,244 @@ def test_deployment_image_paths_exist_and_compose_has_api():
     workflow = (root / ".github/workflows/cd.yml").read_text(encoding="utf-8")
     assert f"file: {dockerfile}" in workflow
     assert "docker compose exec -T postgres" not in workflow
+
+
+def test_installer_llm_skip_preserves_existing_configuration(tmp_path, monkeypatch):
+    import installer
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("OPENAI_API_KEY=existing-secret\n", encoding="utf-8")
+    monkeypatch.setattr(installer, "ENV_FILE", env_path)
+    monkeypatch.setattr("builtins.input", lambda _: "Skip")
+    assert installer.configure_llm_interactive()
+    assert env_path.read_text(encoding="utf-8") == "OPENAI_API_KEY=existing-secret\n"
+
+
+def test_installer_saves_explicit_deepseek_provider_without_echoing_key(
+    tmp_path, monkeypatch, capsys
+):
+    import installer
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("JWT_SECRET=keep-me\n", encoding="utf-8")
+    monkeypatch.setattr(installer, "ENV_FILE", env_path)
+    answers = iter(["Yes", "3", "deepseek-flash"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    monkeypatch.setattr(installer.getpass, "getpass", lambda _: "sk-deepseek-private")
+    assert installer.configure_llm_interactive()
+    content = env_path.read_text(encoding="utf-8")
+    assert "SECAGENT_LLM_PROVIDER=deepseek" in content
+    assert "SECAGENT_LLM_MODEL=deepseek-flash" in content
+    assert "DEEPSEEK_API_KEY=sk-deepseek-private" in content
+    assert "JWT_SECRET=keep-me" in content
+    assert "sk-deepseek-private" not in capsys.readouterr().out
+
+
+def test_installer_custom_route_requires_secure_full_endpoint(tmp_path, monkeypatch):
+    import installer
+
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(installer, "ENV_FILE", env_path)
+    answers = iter(
+        [
+            "Yes",
+            "6",
+            "my-gateway",
+            "my-model",
+            "http://remote.example/v1/chat/completions",
+            "https://gateway.example/v1/chat/completions",
+        ]
+    )
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+    monkeypatch.setattr(installer.getpass, "getpass", lambda _: "gateway-secret")
+    assert installer.configure_llm_interactive()
+    content = env_path.read_text(encoding="utf-8")
+    assert "SECAGENT_LLM_PROVIDER=custom" in content
+    assert "SECAGENT_LLM_NAME=my-gateway" in content
+    assert (
+        "SECAGENT_LLM_ENDPOINT=https://gateway.example/v1/chat/completions" in content
+    )
+    assert "SECAGENT_LLM_API_KEY=gateway-secret" in content
+
+
+def test_cli_reads_selected_env_file_outside_project(tmp_path, monkeypatch):
+    from secagents import cli
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "SECAGENT_LLM_PROVIDER=google\nGEMINI_API_KEY=example-test-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SECAGENT_ENV_FILE", str(env_path))
+    monkeypatch.delenv("SECAGENT_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    cli._load_env()
+    assert cli.os.environ["SECAGENT_LLM_PROVIDER"] == "google"
+    assert cli.os.environ["GEMINI_API_KEY"] == "example-test-key"
+
+
+def test_custom_llm_rejects_remote_cleartext_route(monkeypatch):
+    from secagents.llm.omni import OmniLLM
+
+    monkeypatch.setenv("SECAGENT_LLM_PROVIDER", "custom")
+    monkeypatch.setenv("SECAGENT_LLM_MODEL", "custom-model")
+    monkeypatch.setenv("SECAGENT_LLM_API_KEY", "example-test-key")
+    monkeypatch.setenv(
+        "SECAGENT_LLM_ENDPOINT", "http://remote.example/v1/chat/completions"
+    )
+    with pytest.raises(ValueError, match="HTTPS"):
+        OmniLLM()
+
+
+@pytest.mark.asyncio
+async def test_vault_identifies_deepseek_by_env_name_not_key_prefix(
+    tmp_path, monkeypatch
+):
+    from secagents.vault.env_loader import Vault
+
+    vault = Vault(tmp_path / ".env")
+    seen = []
+
+    async def fake_validate(provider, key):
+        seen.append((provider, key))
+        return True, "ok"
+
+    monkeypatch.setattr(vault, "_cheap_validation", fake_validate)
+    report = await vault._probe_key("DEEPSEEK_API_KEY", "sk-shared-prefix")
+    assert report.status.value == "valid"
+    assert seen == [("deepseek", "sk-shared-prefix")]
+
+
+@pytest.mark.asyncio
+async def test_llm_deepseek_key_uses_deepseek_route_not_openai(monkeypatch):
+    import json
+    import httpx
+    from secagents.llm.omni import LLMMessage, OmniLLM
+
+    monkeypatch.setenv("SECAGENT_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("SECAGENT_LLM_MODEL", "deepseek-flash")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-not-an-openai-key")
+    requests = []
+
+    def responder(request):
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async with OmniLLM() as llm:
+        await llm._client.aclose()
+        llm._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+        response = await llm.complete([LLMMessage("user", "test")])
+    assert response.provider == "deepseek"
+    assert requests[0].url == "https://api.deepseek.com/chat/completions"
+    assert requests[0].headers["authorization"] == "Bearer sk-not-an-openai-key"
+    deepseek_body = json.loads(requests[0].read())
+    assert deepseek_body["model"] == "deepseek-flash"
+    assert deepseek_body["max_tokens"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_llm_custom_route_and_gemini_header(monkeypatch):
+    import httpx
+    from secagents.llm.omni import LLMMessage, OmniLLM
+
+    monkeypatch.setenv("SECAGENT_LLM_PROVIDER", "custom")
+    monkeypatch.setenv("SECAGENT_LLM_MODEL", "custom-model")
+    monkeypatch.setenv("SECAGENT_LLM_API_KEY", "custom-secret")
+    monkeypatch.setenv(
+        "SECAGENT_LLM_ENDPOINT", "https://gateway.example/v2/chat/completions"
+    )
+    monkeypatch.setenv("SECAGENT_LLM_NAME", "my-gateway")
+    requests = []
+
+    def custom_responder(request):
+        requests.append(request)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "custom-ok"}}]}
+        )
+
+    async with OmniLLM() as llm:
+        await llm._client.aclose()
+        llm._client = httpx.AsyncClient(transport=httpx.MockTransport(custom_responder))
+        result = await llm.complete([LLMMessage("user", "test")])
+        assert result.content == "custom-ok"
+        assert result.provider == "my-gateway"
+    assert requests[0].url == "https://gateway.example/v2/chat/completions"
+
+    monkeypatch.setenv("SECAGENT_LLM_PROVIDER", "google")
+    monkeypatch.setenv("SECAGENT_LLM_MODEL", "gemini-3.8-flash")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+    requests.clear()
+
+    def gemini_responder(request):
+        requests.append(request)
+        return httpx.Response(
+            200, json={"candidates": [{"content": {"parts": [{"text": "gemini-ok"}]}}]}
+        )
+
+    async with OmniLLM() as llm:
+        await llm._client.aclose()
+        llm._client = httpx.AsyncClient(transport=httpx.MockTransport(gemini_responder))
+        assert (await llm.complete([LLMMessage("user", "test")])).content == "gemini-ok"
+    assert "key=" not in str(requests[0].url)
+    assert requests[0].headers["x-goog-api-key"] == "gemini-secret"
+
+
+@pytest.mark.asyncio
+async def test_llm_openai_and_claude_use_their_own_auth_and_routes(monkeypatch):
+    import json
+    import httpx
+    from secagents.llm.omni import LLMMessage, OmniLLM
+
+    requests = []
+
+    def responder(request):
+        requests.append(request)
+        if request.url.host == "api.anthropic.com":
+            return httpx.Response(200, json={"content": [{"text": "claude-ok"}]})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "openai-ok"}}]}
+        )
+
+    monkeypatch.setenv("SECAGENT_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("SECAGENT_LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    async with OmniLLM() as llm:
+        await llm._client.aclose()
+        llm._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+        assert (await llm.complete([LLMMessage("user", "test")])).content == "openai-ok"
+    assert requests[0].url == "https://api.openai.com/v1/chat/completions"
+    assert requests[0].headers["authorization"] == "Bearer openai-secret"
+    assert json.loads(requests[0].read())["max_completion_tokens"] == 2048
+
+    monkeypatch.setenv("SECAGENT_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("SECAGENT_LLM_MODEL", "claude-sonnet-5")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "claude-secret")
+    async with OmniLLM() as llm:
+        await llm._client.aclose()
+        llm._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+        assert (await llm.complete([LLMMessage("user", "test")])).content == "claude-ok"
+    assert requests[1].url == "https://api.anthropic.com/v1/messages"
+    assert requests[1].headers["x-api-key"] == "claude-secret"
+
+
+@pytest.mark.asyncio
+async def test_llm_ollama_uses_local_host_without_a_cloud_key(monkeypatch):
+    import httpx
+    from secagents.llm.omni import LLMMessage, OmniLLM
+
+    monkeypatch.setenv("SECAGENT_LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("SECAGENT_LLM_MODEL", "llama3.2:3b")
+    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
+    monkeypatch.delenv("SECAGENT_LLM_API_KEY", raising=False)
+    requests = []
+
+    def responder(request):
+        requests.append(request)
+        return httpx.Response(200, json={"message": {"content": "local-ok"}})
+
+    async with OmniLLM() as llm:
+        await llm._client.aclose()
+        llm._client = httpx.AsyncClient(transport=httpx.MockTransport(responder))
+        assert (await llm.complete([LLMMessage("user", "test")])).content == "local-ok"
+    assert requests[0].url == "http://localhost:11434/api/chat"
+    assert "authorization" not in requests[0].headers

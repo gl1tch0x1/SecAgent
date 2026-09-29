@@ -74,15 +74,32 @@ def _check_docker() -> CheckResult:
 
 
 def _check_api_keys() -> CheckResult:
-    providers = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY"]
+    providers = [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+        "SECAGENT_LLM_API_KEY",
+    ]
     found = [p for p in providers if os.environ.get(p)]
-    ok = len(found) > 0
+    local = os.environ.get("SECAGENT_LLM_PROVIDER") == "ollama" and bool(
+        os.environ.get("OLLAMA_HOST")
+    )
+    ok = bool(found) or local
     return CheckResult(
-        name="API Keys",
+        name="LLM Provider",
         passed=ok,
-        severity="error",
-        message=f"Found: {len(found)} provider(s)" if ok else "No API keys configured",
-        remediation="Set at least one: OPENAI_API_KEY, ANTHROPIC_API_KEY, or GROQ_API_KEY",
+        severity="warning",
+        message="Local Ollama configured"
+        if local
+        else f"Found: {len(found)} provider(s)"
+        if ok
+        else "No LLM provider configured",
+        remediation="Run the installer and choose an LLM provider, or use local Ollama"
+        if not ok
+        else "",
     )
 
 

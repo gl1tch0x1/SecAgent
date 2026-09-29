@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import ipaddress
 from importlib.util import find_spec
 import os
 import platform
@@ -21,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 
 def bootstrap_rich():
@@ -269,6 +272,168 @@ def configure_intel(args: argparse.Namespace) -> bool:
     return True
 
 
+LLM_PROVIDERS = {
+    "1": ("openai", "OpenAI", "OPENAI_API_KEY", "gpt-4o-mini"),
+    "2": ("anthropic", "Claude", "ANTHROPIC_API_KEY", "claude-sonnet-5"),
+    "3": ("deepseek", "DeepSeek", "DEEPSEEK_API_KEY", "deepseek-flash"),
+    "4": ("google", "Gemini", "GEMINI_API_KEY", "gemini-3.8-flash"),
+    "5": ("ollama", "Ollama (local; key optional)", "", "llama3.2:3b"),
+    "6": ("custom", "Other (OpenAI-compatible API)", "SECAGENT_LLM_API_KEY", ""),
+}
+
+
+def _valid_llm_url(value: str, *, require_route: bool) -> bool:
+    try:
+        parsed = urlsplit(value)
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            return False
+        if not parsed.hostname or (
+            parsed.port is not None and not 1 <= parsed.port <= 65535
+        ):
+            return False
+        loopback = parsed.hostname.lower() == "localhost"
+        try:
+            loopback = loopback or ipaddress.ip_address(parsed.hostname).is_loopback
+        except ValueError:
+            pass
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
+            return False
+        return not require_route or parsed.path.rstrip("/") not in ("", "/")
+    except ValueError:
+        return False
+
+
+def _save_llm_config(values: dict[str, str]) -> None:
+    if ENV_FILE.is_symlink():
+        raise ValueError("Refusing to write credentials through a .env symlink")
+    lines = (
+        ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
+    )
+    managed_custom = {
+        "SECAGENT_LLM_API_KEY",
+        "SECAGENT_LLM_ENDPOINT",
+        "SECAGENT_LLM_NAME",
+    }
+    replaced = set(values) | managed_custom
+    lines = [line for line in lines if line.partition("=")[0] not in replaced]
+    lines.extend(f"{key}={value}" for key, value in values.items())
+    temporary = ENV_FILE.with_name(f".env.{secrets.token_hex(8)}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write("\n".join(lines) + "\n")
+        os.replace(temporary, ENV_FILE)
+        if os.name == "posix":
+            ENV_FILE.chmod(0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def configure_llm_interactive() -> bool:
+    """Collect one primary LLM configuration without echoing or logging secrets."""
+    try:
+        while True:
+            answer = (
+                input("Import an LLM API key now? [Y]es / [S]kip: ").strip().lower()
+            )
+            if answer in {"s", "skip", "n", "no"}:
+                console.print(
+                    "[dim]LLM setup skipped; existing configuration is preserved.[/dim]"
+                )
+                return True
+            if answer in {"y", "yes"}:
+                break
+            console.print("[warning]Enter Yes or Skip.[/warning]")
+
+        menu = Table(title="// SELECT AI PROVIDER //", box=ROUNDED)
+        menu.add_column("#", style="hacker")
+        menu.add_column("PROVIDER", style="info")
+        for number, (_, label, _, _) in LLM_PROVIDERS.items():
+            menu.add_row(number, label)
+        console.print(menu)
+        while True:
+            choice = input("Provider [1-6]: ").strip()
+            if choice in LLM_PROVIDERS:
+                break
+            console.print("[warning]Choose a number from 1 to 6.[/warning]")
+
+        provider, _, key_name, suggested_model = LLM_PROVIDERS[choice]
+        values = {"SECAGENT_LLM_PROVIDER": provider}
+        if provider == "custom":
+            while True:
+                name = input("Provider name (letters, digits, . _ -): ").strip()
+                if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", name):
+                    values["SECAGENT_LLM_NAME"] = name
+                    break
+                console.print("[warning]Enter a short provider name.[/warning]")
+
+        while True:
+            label = f"Model ID [{suggested_model}]" if suggested_model else "Model ID"
+            model = input(f"{label}: ").strip() or suggested_model
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", model):
+                values["SECAGENT_LLM_MODEL"] = model
+                break
+            console.print(
+                "[warning]Enter the exact model ID from your provider.[/warning]"
+            )
+
+        if provider in {"custom", "ollama"}:
+            default_url = "http://localhost:11434" if provider == "ollama" else ""
+            while True:
+                label = (
+                    "Ollama host"
+                    if provider == "ollama"
+                    else "Full chat/completions URL"
+                )
+                route = input(
+                    f"{label}{f' [{default_url}]' if default_url else ''}: "
+                ).strip()
+                route = route or default_url
+                if _valid_llm_url(route, require_route=provider == "custom") and (
+                    provider != "ollama" or not urlsplit(route).path.strip("/")
+                ):
+                    values[
+                        "OLLAMA_HOST"
+                        if provider == "ollama"
+                        else "SECAGENT_LLM_ENDPOINT"
+                    ] = route
+                    break
+                console.print(
+                    "[warning]Use HTTPS, or HTTP on loopback only; include a route for Other.[/warning]"
+                )
+
+        if provider == "ollama":
+            key = getpass.getpass("Optional proxy API key (Enter for none): ").strip()
+            if key:
+                values["SECAGENT_LLM_API_KEY"] = key
+            else:
+                values["SECAGENT_LLM_API_KEY"] = ""
+            values["OLLAMA_MODEL"] = values["SECAGENT_LLM_MODEL"]
+        else:
+            while True:
+                key = getpass.getpass("API key (hidden): ").strip()
+                if key and not any(char.isspace() or ord(char) < 32 for char in key):
+                    values[key_name] = key
+                    break
+                console.print(
+                    "[warning]Enter a nonempty API key without whitespace.[/warning]"
+                )
+
+        _save_llm_config(values)
+        console.print(
+            f"[success]LLM provider {provider} saved to local .env.[/success]"
+        )
+        return True
+    except (EOFError, KeyboardInterrupt):
+        console.print(
+            "\n[warning]LLM setup skipped; existing configuration is preserved.[/warning]"
+        )
+        return True
+    except (OSError, ValueError) as exc:
+        console.print(f"[error]Could not save LLM configuration: {exc}[/error]")
+        return False
+
+
 def create_entrypoints() -> bool:
     ui.update_log("Deploying operational entrypoints...")
     if IS_WIN:
@@ -383,6 +548,11 @@ def main():
     parser.add_argument("--no-test", action="store_true")
     parser.add_argument("--no-start", action="store_true")
     parser.add_argument(
+        "--skip-llm-setup",
+        action="store_true",
+        help="Skip the interactive LLM provider setup",
+    )
+    parser.add_argument(
         "--allowed-domains",
         help="Explicit comma-separated target domains to authorize in .env",
     )
@@ -430,6 +600,8 @@ def main():
 
     if console.is_terminal:
         console.clear()
+    if overall_success and not args.skip_llm_setup and sys.stdin.isatty():
+        overall_success = configure_llm_interactive()
     print_final_report(overall_success, verified=not args.no_test)
     return 0 if overall_success else 1
 

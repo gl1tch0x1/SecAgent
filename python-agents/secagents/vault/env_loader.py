@@ -94,6 +94,7 @@ class Vault:
             "GEMINI_API_KEY",
             "OPENROUTER_API_KEY",
             "XAI_API_KEY",
+            "SECAGENT_LLM_API_KEY",
         ):
             val = os.environ.get(env_name, "").strip()
             if val:
@@ -101,8 +102,19 @@ class Vault:
         return keys
 
     async def _probe_key(self, name: str, api_key: str) -> KeyReport:
-        provider = detect_provider_from_key(api_key)
+        named_providers = {
+            "OPENAI_API_KEY": "openai",
+            "ANTHROPIC_API_KEY": "anthropic",
+            "DEEPSEEK_API_KEY": "deepseek",
+            "GEMINI_API_KEY": "google",
+            "GROQ_API_KEY": "groq",
+            "OPENROUTER_API_KEY": "openrouter",
+            "SECAGENT_LLM_API_KEY": "custom",
+        }
+        provider = named_providers.get(name, detect_provider_from_key(api_key))
         masked = mask_secret(api_key)
+        if provider == "custom":
+            return KeyReport(name, KeyStatus.PRESENT, masked, "Custom endpoint not probed")
         try:
             ok, msg = await self._cheap_validation(provider, api_key)
             if ok:
@@ -126,24 +138,21 @@ class Vault:
                 return False, f"OpenAI validation failed ({resp.status_code})"
 
             if provider == "anthropic":
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
+                resp = await client.get(
+                    "https://api.anthropic.com/v1/models",
                     headers={
                         "x-api-key": api_key,
                         "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": "claude-3-haiku-20240307",
-                        "max_tokens": 1,
-                        "messages": [{"role": "user", "content": "ping"}],
                     },
                 )
-                if resp.status_code in (200, 429):
-                    return True, "Anthropic reachable"
-                if resp.status_code == 401:
-                    return False, "Invalid Anthropic key"
-                return True, f"Anthropic {resp.status_code}"
+                return resp.status_code == 200, f"Anthropic models {resp.status_code}"
+
+            if provider == "deepseek":
+                resp = await client.get(
+                    "https://api.deepseek.com/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                return resp.status_code == 200, f"DeepSeek models {resp.status_code}"
 
             if provider == "groq":
                 resp = await client.get(
@@ -154,7 +163,8 @@ class Vault:
 
             if provider == "google":
                 resp = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1/models?key={api_key}",
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    headers={"x-goog-api-key": api_key},
                 )
                 return resp.status_code == 200, f"Gemini {resp.status_code}"
 
@@ -232,8 +242,21 @@ class Vault:
                 print(line)
 
     def any_llm_available(self) -> bool:
+        if os.environ.get("SECAGENT_LLM_PROVIDER") == "ollama" and os.environ.get("OLLAMA_HOST"):
+            return True
         return any(
             r.status in (KeyStatus.VALID, KeyStatus.PRESENT)
             for r in self.reports
-            if "LLM" in r.name or "API_KEY" in r.name
+            if r.name
+            in {
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "GEMINI_API_KEY",
+                "GROQ_API_KEY",
+                "OPENROUTER_API_KEY",
+                "XAI_API_KEY",
+                "SECAGENT_LLM_API_KEY",
+            }
+            or r.name.startswith("LLM_API_KEYS[")
         )

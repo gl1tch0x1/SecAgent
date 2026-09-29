@@ -94,12 +94,20 @@ def print_banner():
 
 
 def _load_env() -> None:
+    override = os.environ.get("SECAGENT_ENV_FILE", "").strip()
+    paths = [Path(override)] if override else [Path.cwd() / ".env"]
+    project_env = Path(__file__).resolve().parents[2] / ".env"
+    if not override and project_env not in paths:
+        paths.append(project_env)
     try:
         from dotenv import load_dotenv
 
-        load_dotenv()
+        for path in paths:
+            if path.is_file():
+                load_dotenv(dotenv_path=path, override=False)
     except ImportError:
-        Vault(Path(".env")).load()
+        for path in paths:
+            Vault(path).load()
 
 
 def build_parser() -> argparse.ArgumentParser:
