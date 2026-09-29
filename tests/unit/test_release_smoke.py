@@ -245,6 +245,7 @@ def test_updater_check_only_and_fast_forward_install(monkeypatch):
     import update
 
     calls = []
+    monkeypatch.setattr(update, "_clear_terminal", lambda: calls.append(("clear",)))
     monkeypatch.setattr(update, "_banner", lambda: None)
     monkeypatch.setattr(update, "_display", lambda *args, **kwargs: None)
     monkeypatch.setattr(update, "_check_repository", lambda: None)
@@ -266,10 +267,69 @@ def test_updater_check_only_and_fast_forward_install(monkeypatch):
 
     monkeypatch.setattr(update, "_git", fake_git)
     assert update.main(["--check-only"]) == 0
+    assert calls.count(("clear",)) == 1
     assert not any(args[0] in {"merge", "install"} for args in calls)
     assert update.main(["--allowed-domains", "app.example"]) == 0
     assert ("merge", "--ff-only", "b" * 40) in calls
     assert ("install", "app.example") in calls
+    assert calls.count(("clear",)) == 2
+
+
+def test_updater_clears_only_interactive_terminal(monkeypatch):
+    import io
+
+    import update
+    from rich.console import Console
+
+    class TerminalOutput(io.StringIO):
+        def isatty(self):
+            return True
+
+    calls = []
+    monkeypatch.setattr(Console, "clear", lambda self: calls.append("clear"))
+    monkeypatch.setattr(update.sys, "stdout", TerminalOutput())
+    update._clear_terminal()
+    assert calls == ["clear"]
+    monkeypatch.setattr(update.sys, "stdout", io.StringIO())
+    update._clear_terminal()
+    assert calls == ["clear"]
+
+
+@pytest.mark.parametrize("terminal_width", [72, 100, 160])
+def test_scan_display_shows_observed_stages_and_budget(terminal_width, monkeypatch):
+    import io
+    from types import SimpleNamespace
+
+    from rich.console import Console
+    from secagents import cli
+
+    output = io.StringIO()
+    monkeypatch.setattr(
+        cli,
+        "console",
+        Console(
+            file=output,
+            force_terminal=False,
+            width=terminal_width,
+            theme=cli.custom_theme,
+        ),
+    )
+    pipeline = SimpleNamespace(
+        budget=SimpleNamespace(
+            snapshot=lambda: {"requests_used": 7, "request_limit": 100}
+        )
+    )
+    display = cli.ScanDisplay("app.example", pipeline)
+    display.update("PREFLIGHT", "start")
+    display.update("PREFLIGHT", "done")
+    display.update("INTEL", "start")
+    cli.console.print(display.render())
+    rendered = output.getvalue()
+    assert "PREFLIGHT" in rendered
+    assert "READY" in rendered
+    assert "INTEL" in rendered
+    assert "7/100" in rendered
+    assert all(len(line) <= terminal_width for line in rendered.splitlines())
 
 
 def test_updater_propagates_installer_failure(monkeypatch):
@@ -330,6 +390,53 @@ async def test_health_endpoint_reports_degraded_without_inventing_readiness(
     response = await health_checks.health()
     assert response.status_code == 200
     assert b'"status":"degraded"' in response.body
+
+
+def test_health_timestamps_are_timezone_aware_utc():
+    from datetime import timezone
+
+    from secagents.infra.health_checks import AgentHealthTracker, HealthCheck, Metrics
+
+    assert HealthCheck().startup_time.tzinfo == timezone.utc
+    assert Metrics().startup_time.tzinfo == timezone.utc
+    tracker = AgentHealthTracker()
+    assert tracker.get_agent_status("recon")["status"] == "degraded"
+    assert tracker.get_agent_status("recon")["last_heartbeat"] is None
+    tracker.record_heartbeat("recon")
+    assert tracker.agents["recon"]["last_heartbeat"].tzinfo == timezone.utc
+    assert tracker.get_agent_status("recon")["heartbeat_age_seconds"] >= 0
+    tracker.record_failure("recon")
+    assert tracker.get_agent_status("recon")["status"] == "unhealthy"
+
+
+def test_health_metrics_do_not_invent_completed_scans_or_duration():
+    from secagents.infra.health_checks import Metrics
+
+    metrics = Metrics()
+    metrics.record_scan_completion(3)
+    metrics.record_scan_failure()
+    assert metrics.get_metrics()["active_scans"] == 0
+    assert metrics.get_metrics()["completed_scans"] == 0
+    metrics.record_scan_start()
+    metrics.record_scan_completion(2)
+    result = metrics.get_metrics()
+    assert result["total_findings"] == 2
+    assert result["completed_scans"] == 1
+    assert result["active_scans"] == 0
+    assert result["avg_scan_duration_seconds"] >= 0
+
+
+def test_pipeline_progress_callback_does_not_affect_scan_state():
+    from secagents.pipeline.runner import ScanPipeline
+
+    pipeline = ScanPipeline(target="app.example")
+    events = []
+    pipeline.on_progress = lambda stage, state: events.append((stage, state))
+    pipeline._progress("PREFLIGHT", "start")
+    assert events == [("PREFLIGHT", "start")]
+    pipeline.on_progress = lambda *_: (_ for _ in ()).throw(RuntimeError("display"))
+    pipeline._progress("PREFLIGHT", "done")
+    assert pipeline.results["findings"] == []
 
 
 def test_deployment_image_paths_exist_and_compose_has_api():

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import hashlib
 from pathlib import Path
+from typing import Callable
 from rich.console import Console
 
 from secagents.operational.integrity import check_os_security_updates, OS_UPDATE_MESSAGE
@@ -96,6 +97,7 @@ class ScanPipeline:
             max_duration_seconds=max_duration_seconds,
         )
         self.results: dict = {"target": target, "phases": {}, "findings": [], "chains": []}
+        self.on_progress: Callable[[str, str], None] | None = None
         self.console = Console()
         self.context = ScanContext(
             target=target,
@@ -116,6 +118,13 @@ class ScanPipeline:
             max_payload_variants=max_payload_variants,
             fuzz_cooldown_seconds=fuzz_cooldown_seconds,
         )
+
+    def _progress(self, stage: str, state: str) -> None:
+        if self.on_progress is not None:
+            try:
+                self.on_progress(stage, state)
+            except Exception:
+                pass  # Display failures must not change scan results.
 
     def _record_phase(
         self,
@@ -164,7 +173,7 @@ class ScanPipeline:
             domain = enforce_scope(self.target)
             self.results["domain"] = domain
         except ScopeViolationError as e:
-            self.console.print(f"[bold red]⛔ Scope Violation:[/bold red] {e}")
+            self.console.print(f"[bold red]Scope violation:[/bold red] {e}")
             raise ScopeViolationError(str(e)) from e
 
         ok, msg = check_os_security_updates(skip=self.skip_os_check)
@@ -209,7 +218,7 @@ class ScanPipeline:
 
     async def _run_external_intel(self, domain: str) -> dict:
         self.console.print(
-            "[bold blue]󰋼[/bold blue] [white]Extracting external intelligence...[/white]"
+            "[bold blue]>[/bold blue] [white]Extracting external intelligence...[/white]"
         )
         intel: dict = {}
         providers: dict[str, str] = {}
@@ -345,7 +354,7 @@ class ScanPipeline:
         shared: dict | None = None,
     ):
         self.console.print(
-            "[bold blue]󰋼[/bold blue] [white]Deploying agent swarm (The Armada)...[/white]"
+            "[bold blue]>[/bold blue] [white]Deploying agent swarm (The Armada)...[/white]"
         )
         if shared is None:
             shared = {
@@ -423,7 +432,7 @@ class ScanPipeline:
     ):
         if self.arsenal_secondary and not armada_results.get("failures"):
             self.console.print(
-                "[bold blue]󰋼[/bold blue] [white]Engaging secondary heuristic probes (The Arsenal)...[/white]"
+                "[bold blue]>[/bold blue] [white]Engaging secondary heuristic probes (The Arsenal)...[/white]"
             )
             scanner = ArsenalScanner(
                 verify_ssl=os.environ.get("SECAGENT_VERIFY_SSL", "true").lower() != "false",
@@ -461,13 +470,15 @@ class ScanPipeline:
         return raw_findings
 
     async def run(self) -> dict:
+        self._progress("PREFLIGHT", "start")
         domain = await self._scope_and_preflight()
+        self._progress("PREFLIGHT", "done")
 
         from secagents.core.skill_manager import skill_manager
 
         if skill_manager.skills:
             self.console.print(
-                "[bold green]🔥[/bold green] [white]Advanced Hunting Skills loaded from SKILL.md[/white]"
+                "[bold green]+[/bold green] [white]Advanced Hunting Skills loaded from SKILL.md[/white]"
             )
 
         if self.setup_local_llm:
@@ -508,9 +519,15 @@ class ScanPipeline:
             ),
         )
 
+        self._progress("INTEL", "start")
         intel = await self._run_external_intel(domain)
+        self._progress("INTEL", "done")
+        self._progress("INVENTORY", "start")
         templates = await self._run_api_inventory(domain)
+        self._progress("INVENTORY", "done")
+        self._progress("BROWSER", "start")
         browser_result = await self._run_browser_discovery(domain)
+        self._progress("BROWSER", "done")
 
         shared: dict = {
             "target": domain,
@@ -529,10 +546,12 @@ class ScanPipeline:
             "fuzz_cooldown_seconds": self.fuzz_cooldown_seconds,
             "fuzz_memory": AuraMemoryManager.get_instance() if self.fuzz_payloads else None,
         }
+        self._progress("SCAN", "start")
         armada_results, raw_findings = await self._run_armada(
             domain, intel, templates, browser_result, shared
         )
         raw_findings = await self._run_arsenal(domain, armada_results, raw_findings, shared)
+        self._progress("SCAN", "done")
 
         # Deduplicate
         seen: set[str] = set()
@@ -563,8 +582,9 @@ class ScanPipeline:
 
         # 6. The Crucible
         self.console.print(
-            "[bold blue]󰋼[/bold blue] [white]Validating signals and correlating chains (The Crucible)...[/white]"
+            "[bold blue]>[/bold blue] [white]Validating signals and correlating chains (The Crucible)...[/white]"
         )
+        self._progress("PROOF", "start")
         crucible = CrucibleValidator(budget=self.budget, auth_headers=self.auth_headers)
         try:
             outcomes = await crucible.validate_batch(unique)
@@ -684,6 +704,7 @@ class ScanPipeline:
             self.results["chains"] = await crucible.correlate_chains(validated)
         finally:
             await crucible.aclose()
+        self._progress("PROOF", "done")
 
         registry = RegressionRegistry(self.results_dir / "regression")
         for f in validated:
@@ -722,8 +743,9 @@ class ScanPipeline:
 
         # 7. Remediation
         self.console.print(
-            "[bold blue]󰋼[/bold blue] [white]Generating breach reports and auto-patches...[/white]"
+            "[bold blue]>[/bold blue] [white]Generating breach reports and auto-patches...[/white]"
         )
+        self._progress("REPORT", "start")
         patcher = AutoPatcher()
         patcher.apply_to_findings(validated)
         reporter = ReportGenerator(self.results_dir / "reports")
@@ -799,11 +821,13 @@ class ScanPipeline:
 
         # 8. Hermes
         self.console.print(
-            "[bold blue]󰋼[/bold blue] [white]Archiving mission data to persistent memory...[/white]"
+            "[bold blue]>[/bold blue] [white]Archiving mission data to persistent memory...[/white]"
         )
         hermes = HermesMemory(self.results_dir / "hermes" / "memory.db")
         retro = RetrospectiveAgent(hermes)
         self.results["hermes"] = retro.analyze(self.results)
         hermes.export_json(self.results_dir / "hermes" / "export.json")
+
+        self._progress("REPORT", "done")
 
         return self.results

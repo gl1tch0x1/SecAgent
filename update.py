@@ -4,35 +4,52 @@
 from __future__ import annotations
 
 import argparse
+import os
 from importlib.util import find_spec
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
 BANNER = r"""
-    _____           ___                    __
-   / ___/___  _____/   | ____ ____  ____  / /______
-   \__ \/ _ \/ ___/ /| |/ __ `/ _ \/ __ \/ __/ ___/
-  ___/ /  __/ /__/ ___ / /_/ /  __/ / / / /_(__  )
- /____/\___/\___/_/  |_\__, /\___/_/ /_/_/   \___/
-                      /____/
+      _____           ___                    __
+     / ___/___  _____/   | ____ ____  ____  / /______
+     \__ \/ _ \/ ___/ /| |/ __ `/ _ \/ __ \/ __/ ___/
+    ___/ /  __/ /__/ ___ / /_/ /  __/ / / / /_(__  )
+   /____/\___/\___/_/  |_\__, /\___/_/ /_/_/   \___/
+                        /____/
 """
 
 ROOT = Path(__file__).resolve().parent
 
 
+def _clear_terminal() -> None:
+    """Clear only an interactive terminal; leave redirected update logs intact."""
+    if not sys.stdout.isatty():
+        return
+    if find_spec("rich") is not None:
+        from rich.console import Console
+
+        Console().clear()
+    elif os.name != "nt":
+        print("\033[2J\033[H", end="", flush=True)
+
+
 def _display(message: str, *, level: str = "info") -> None:
+    stamp = time.strftime("%H:%M:%S")
     if find_spec("rich") is None:
-        print(f"[{level.upper()}] {message}")
+        print(f"{stamp}  {level.upper():7}  {message}")
         return
     from rich.console import Console
-    from rich.panel import Panel
+    from rich.text import Text
 
     colors = {"info": "cyan", "success": "green", "warning": "yellow", "error": "red"}
     Console().print(
-        Panel(message, border_style=colors.get(level, "cyan"), expand=False)
+        Text(stamp, style="dim"),
+        Text(f"{level.upper():7}", style=colors.get(level, "cyan")),
+        Text(message),
     )
 
 
@@ -41,19 +58,22 @@ def _banner() -> None:
         print(BANNER)
         print("[ SECAGENT // SECURE UPLINK ]")
         return
+    from rich.align import Align
     from rich.console import Console, Group
     from rich.panel import Panel
     from rich.text import Text
 
-    Console().print(
-        Panel(
-            Group(
-                Text(BANNER, style="bold green"),
-                Text("// SECURE UPLINK  ::  FAST-FORWARD ONLY //", style="bold cyan"),
-            ),
-            border_style="green",
-            expand=False,
+    display = Console()
+    header = (
+        Group(
+            Text(BANNER.strip("\n"), style="bold green"),
+            Text("// SECURE UPLINK  ::  FAST-FORWARD ONLY //", style="bold cyan"),
         )
+        if display.width >= 76
+        else Text("SECAGENT  /  SECURE UPLINK", style="bold green")
+    )
+    display.print(
+        Align.center(Panel(header, border_style="green", width=min(display.width, 78)))
     )
 
 
@@ -132,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         "--allowed-domains", help="Explicit authorized domains to pass to installer"
     )
     args = parser.parse_args(argv)
+    _clear_terminal()
     _banner()
     try:
         _check_repository()

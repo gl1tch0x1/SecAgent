@@ -561,6 +561,8 @@ Options:
 
 The bounded default scan meters built-in HTTP requests and configured Shodan/Chaos provider requests. Optional external binaries remain disabled because their internal traffic cannot be metered by this budget. Browser discovery and XSS proof require Playwright and Chromium. The scan handlers run on the host; use an operator-managed container or virtual machine when runtime isolation is required. Reports record consumed budget, termination reason, findings, manual leads, and coverage gaps.
 
+In an interactive terminal, scanning shows a live stage board for preflight, intelligence, inventory, browser discovery, scanning, proof and reporting. The board displays observed stage transitions, request consumption and elapsed time; the completion screen reports validated findings and traffic accounting. Redirected output uses chronological text events instead of terminal animation. A partial scan is labeled with coverage gaps.
+
 Inspect the hunting skills with `secagent skills` or `secagent skills --show APIAssessment`. `secagent hunt-plan -t app.example --focus api --request-budget 100` uses the saved primary LLM to generate a scoped, evidence-first plan. Other focuses are `recon`, `web`, `business`, `ai`, and `proof`. This command sends one prompt to the configured LLM service and performs no target probes; the plan contains hypotheses, not findings. A saved key is reused automatically. The role prompts now load matching modular skills for reconnaissance, web, API, business logic, planning, AI, and evidence review.
 
 ### Bounded fuzzing
@@ -682,7 +684,7 @@ secagent hardware
 python update.py --allowed-domains app.example
 ```
 
-The updater fetches `origin/main`, reports newer commits, and advances `main` only when the working tree is clean and the update is a fast-forward. It then runs the installer and returns an error if installation fails. It never resets or discards local changes. Use `--reinstall` to verify an already current checkout. Packaged installations without `update.py` report release status; update those through their package manager.
+The updater clears an interactive terminal before showing its status and timestamped events; redirected logs remain intact. It fetches `origin/main`, reports newer commits, and advances `main` only when the working tree is clean and the update is a fast-forward. It then runs the installer and returns an error if installation fails. It never resets or discards local changes. Use `--reinstall` to verify an already current checkout. Packaged installations without `update.py` report release status; update those through their package manager.
 
 ---
 

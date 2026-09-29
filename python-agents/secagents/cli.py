@@ -8,26 +8,23 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List, Dict, Any
 
 import httpx
+from rich.align import Align
 from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    BarColumn,
-    TimeElapsedColumn,
-    TaskProgressColumn,
-)
+from rich.spinner import Spinner
 from rich.text import Text
 from rich.theme import Theme
 from rich.box import ROUNDED, DOUBLE_EDGE
@@ -64,31 +61,146 @@ console = Console(theme=custom_theme)
 
 # ─── ASCII ARSENAL ───────────────────────────────────────────────────────────
 BANNER = r"""
-   ____             __  ___   ____                 
-  / __ \___  ___   / / / _ | / __/___  ____  ____ 
- / / / / _ \/ _ \ / / / __ |/ /_/ __ \/ __ \/ __ \
-/ /_/ /  __/  __// / / /_/ / __/ /_/ / / / / /_/ /
-\____/ \___|\___/_/  \____/_/  \____/_/_/ /_/ .___/
-                                          /_/     
+      _____           ___                    __
+     / ___/___  _____/   | ____ ____  ____  / /______
+     \__ \/ _ \/ ___/ /| |/ __ `/ _ \/ __ \/ __/ ___/
+    ___/ /  __/ /__/ ___ / /_/ /  __/ / / / /_(__  )
+   /____/\___/\___/_/  |_\__, /\___/_/ /_/_/   \___/
+                        /____/
 """
 
 
 def print_banner():
-    banner_text = Text(BANNER, style="hacker")
+    banner_text = Text(BANNER.strip("\n"), style="hacker")
     subtext = Text.from_markup(
         f"\n[bold white]SECAGENT // OFFENSIVE OPERATIONS CONSOLE[/]"
-        f"\n[bold cyan]RECON[/] [dim]·[/] [bold magenta]VERIFY[/] [dim]·[/] [bold green]REPORT[/]"
+        f"\n[bold cyan]RECON[/] [dim]/[/] [bold magenta]VERIFY[/] [dim]/[/] [bold green]REPORT[/]"
         f"\n[dim]Version {__version__} | authorized security assessment workflow[/]\n"
     )
+    header = (
+        Group(banner_text, subtext)
+        if console.width >= 76
+        else Text("SECAGENT  /  RECON  /  VERIFY  /  REPORT", style="hacker")
+    )
     console.print(
-        Panel(
-            Group(banner_text, subtext),
-            border_style="#00ff66",
-            box=DOUBLE_EDGE,
-            expand=False,
-            padding=(1, 2),
+        Align.center(
+            Panel(
+                header,
+                border_style="#00ff66",
+                box=DOUBLE_EDGE,
+                width=min(console.width, 78),
+                padding=(1, 2),
+            )
         )
     )
+
+
+class ScanDisplay:
+    """Bounded live scan view driven by observed pipeline stage events."""
+
+    STAGES = ("PREFLIGHT", "INTEL", "INVENTORY", "BROWSER", "SCAN", "PROOF", "REPORT")
+
+    def __init__(self, target: str, pipeline: ScanPipeline):
+        self.target = target
+        self.pipeline = pipeline
+        self.states = {stage: "queued" for stage in self.STAGES}
+        self.active = "PREFLIGHT"
+        self.events: list[tuple[str, str]] = []
+        self.started = time.monotonic()
+
+    def update(self, stage: str, state: str) -> None:
+        if stage not in self.states or state not in {"start", "done"}:
+            return
+        self.states[stage] = "running" if state == "start" else "ready"
+        if state == "start":
+            self.active = stage
+        message = f"{stage.title()} {'started' if state == 'start' else 'completed'}"
+        stamp = time.strftime("%H:%M:%S")
+        self.events.append((stamp, message))
+        self.events = self.events[-12:]
+        if not console.is_terminal:
+            console.print(f"{stamp}  {message}", markup=False)
+
+    def __rich_console__(self, _console, _options):
+        yield self.render()
+
+    def render(self):
+        width = min(console.width, 102)
+        compact = width < 86
+        stages = Table(box=None, expand=True, padding=(0, 1))
+        stages.add_column("PHASE", style="bold white")
+        stages.add_column("STATE", justify="right")
+        for stage in self.STAGES:
+            state = self.states[stage]
+            label = (
+                Spinner("line", text="RUNNING", style="info")
+                if state == "running"
+                else Text(state.upper(), style="success" if state == "ready" else "dim")
+            )
+            stages.add_row(stage, label)
+        feed = Table(box=None, show_header=False, expand=True, padding=(0, 1))
+        feed.add_column("TIME", width=8, style="dim", no_wrap=True)
+        feed.add_column("EVENT", overflow="fold")
+        for stamp, message in self.events[-(6 if compact else 10) :]:
+            feed.add_row(stamp, message)
+        if not self.events:
+            feed.add_row("--:--:--", "Awaiting pipeline events")
+        stage_width = 38 if width >= 96 else 36
+        left = Panel(
+            stages,
+            title="[hacker]01 / SCAN PHASES[/hacker]",
+            border_style="green",
+            width=width if compact else stage_width,
+        )
+        right = Panel(
+            feed,
+            title="[info]02 / EXECUTION LOG[/info]",
+            border_style="cyan",
+            width=width if compact else width - stage_width,
+        )
+        if compact:
+            body = Group(left, right)
+        else:
+            grid = Table.grid(padding=0)
+            grid.add_column()
+            grid.add_column()
+            grid.add_row(left, right)
+            body = grid
+        budget = self.pipeline.budget.snapshot()
+        elapsed = int(time.monotonic() - self.started)
+        meter = Text()
+        meter.append(
+            f"  REQUESTS  {budget['requests_used']}/{budget['request_limit']}", style="info"
+        )
+        meter.append(f"    ACTIVE  {self.active}", style="bold white")
+        meter.append(f"    ELAPSED  {elapsed // 60:02d}:{elapsed % 60:02d}", style="dim")
+        header = (
+            Panel(
+                Group(
+                    Text(BANNER.strip("\n"), style="hacker"),
+                    Text("SCOPED SCAN  /  OBSERVE  /  VERIFY  /  REPORT", style="info"),
+                ),
+                border_style="green",
+                width=width,
+            )
+            if width >= 76
+            else Panel("SECAGENT  /  SCOPED SCAN", border_style="green", width=width)
+        )
+        return Align.center(
+            Group(
+                header,
+                Panel(
+                    Text(self.target, style="target"),
+                    title="AUTHORIZED TARGET",
+                    border_style="bright_black",
+                    width=width,
+                ),
+                body,
+                Panel(meter, border_style="magenta", padding=(0, 0), width=width),
+            ),
+            vertical="top",
+            width=width,
+        )
 
 
 # ─── Core Logic ─────────────────────────────────────────────────────────────
@@ -465,7 +577,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     try:
         domain = enforce_scope(args.target)
     except ScopeViolationError as e:
-        console.print(f"[error]⛔ Scope Violation:[/error] {e}")
+        console.print(f"[error]Scope violation:[/error] {e}")
         return 2
 
     try:
@@ -538,22 +650,23 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         console.print(f"[error]Scan configuration error:[/error] {exc}")
         return 2
 
+    display = ScanDisplay(domain, pipeline)
+    pipeline.on_progress = display.update
+    pipeline.console = console
     try:
-        with Progress(
-            SpinnerColumn(spinner_name="dots", style="cyan"),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=40, complete_style="hacker", finished_style="success"),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(
-                description=f"Orchestrating agents against {domain}...", total=None
-            )
+        if console.is_terminal:
+            with Live(display, console=console, refresh_per_second=4, screen=True):
+                results = await pipeline.run()
+            if not args.targets_file:
+                console.clear()
+                print_banner()
+        else:
             results = await pipeline.run()
-            progress.update(task, completed=100)
     except Exception as e:
-        console.print(f"[error]❌ Mission Failure:[/error] {e}")
+        if console.is_terminal and not args.targets_file:
+            console.clear()
+            print_banner()
+        console.print(f"[error]Scan failed:[/error] {e}")
         return 2
 
     findings: List[Dict[str, Any]] = results.get("findings", [])
@@ -572,12 +685,19 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     table.add_column("CONFIDENCE", justify="center", width=10)
 
     for f in findings:
-        sev = f.get("severity", "medium").lower()
+        sev = str(f.get("severity", "unknown")).lower()
+        if sev not in {"critical", "high", "medium", "low", "info"}:
+            sev = "unknown"
+        try:
+            confidence = float(f.get("confidence", 0))
+            confidence = max(0.0, min(1.0, confidence)) if math.isfinite(confidence) else 0.0
+        except (TypeError, ValueError):
+            confidence = 0.0
         table.add_row(
-            f"[{sev}]{sev.upper()}[/{sev}]",
-            f.get("title", f.get("type", "Unknown")),
-            f.get("url", f.get("endpoint", "N/A")),
-            f"{int(float(f.get('confidence', 0)) * 100)}%",
+            Text(sev.upper(), style=sev if sev != "unknown" else "dim"),
+            Text(str(f.get("title", f.get("type", "Unknown")))),
+            Text(str(f.get("url", f.get("endpoint", "N/A")))),
+            f"{int(confidence * 100)}%",
         )
 
     console.print("\n")
@@ -588,7 +708,7 @@ async def cmd_scan(args: argparse.Namespace) -> int:
         if results.get("chains"):
             console.print(
                 Panel(
-                    f"[bold yellow]⛓️ Attack Chains Detected:[/bold yellow] Found {len(results['chains'])} correlated exploit path(s).",
+                    f"Correlated attack paths: {len(results['chains'])}.",
                     border_style="yellow",
                 )
             )
@@ -610,9 +730,26 @@ async def cmd_scan(args: argparse.Namespace) -> int:
             f"[error]Scan budget ended the run: {results['budget']['termination_reason']}; coverage is incomplete.[/error]"
         )
 
-    console.print(
-        f"\n[success]✅ OPERATION COMPLETE[/success] — {len(findings)} Validated Signal(s) Extracted."
+    incomplete = bool(
+        results.get("phases", {}).get("armada_failures")
+        or results.get("budget", {}).get("termination_reason")
     )
+    outcome = "SCAN FINISHED WITH COVERAGE GAPS" if incomplete else "SCAN COMPLETE"
+    console.print(
+        f"\n[{'warning' if incomplete else 'success'}]{outcome}[/]  /  {len(findings)} validated finding(s)"
+    )
+    budget = results.get("budget") or {}
+    if budget:
+        console.print(
+            Panel(
+                f"Requests {budget.get('requests_used', 0)}/{budget.get('request_limit', '?')}"
+                f"  /  Elapsed {budget.get('elapsed_seconds', 0)}s"
+                f"  /  Stop: {budget.get('termination_reason') or 'normal completion'}",
+                title="TRAFFIC ACCOUNTING",
+                border_style="cyan",
+                expand=False,
+            )
+        )
 
     if results.get("reports"):
         r_table = Table(box=None, padding=(0, 2))
@@ -853,10 +990,10 @@ async def cmd_keyhacks(args: argparse.Namespace) -> int:
             paths.append(str(path))
 
     if not paths:
-        console.print("[warning]⚠ No assets found for auditing.[/warning]")
+        console.print("[warning]No assets found for auditing.[/warning]")
         return 0
 
-    console.print(f"[info]󰋼[/info] Auditing {len(paths)} assets for leaked secrets...")
+    console.print(f"[info]>[/info] Auditing {len(paths)} assets for leaked secrets...")
     with console.status("[bold yellow]Scanning assets..."):
         findings = await agent.scan_paths(paths[:1000])
 
@@ -879,7 +1016,7 @@ async def cmd_keyhacks(args: argparse.Namespace) -> int:
     else:
         console.print(
             Panel(
-                "[success]✓ No leaked keys detected in local assets.[/success]",
+                "[success]No leaked keys detected in local assets.[/success]",
                 border_style="success",
             )
         )
@@ -936,7 +1073,7 @@ def main() -> None:
             for r in results:
                 table.add_row(
                     r.name,
-                    f"{'[green]PASS[/green]' if r.passed else '[red]FAIL[/red]'} — {r.message}",
+                    f"{'[green]PASS[/green]' if r.passed else '[red]FAIL[/red]'} - {r.message}",
                 )
             console.print(table)
         elif args.command == "update":
@@ -991,7 +1128,7 @@ def main() -> None:
             if args.purge_decay:
                 purged = mem.apply_decay()
                 console.print(
-                    f"[success]✓ Memory decay applied: purged {purged} stale patterns.[/success]"
+                    f"[success]Memory decay applied: purged {purged} stale patterns.[/success]"
                 )
 
             info = mem.inspect_memory(target=args.target)
@@ -1082,11 +1219,11 @@ def main() -> None:
             runner = PlaybookRunner(pb)
             success = runner.run(args.target)
             msg = (
-                "[success]✓ Playbook execution complete.[/success]"
+                "[success]Playbook execution complete.[/success]"
                 if success
-                else "[error]❌ Playbook execution incomplete.[/error]"
+                else "[error]Playbook execution incomplete.[/error]"
             )
-            console.print(Panel(msg, title=f"PLAYBOOK — {pb.name.upper()}", border_style="cyan"))
+            console.print(Panel(msg, title=f"PLAYBOOK - {pb.name.upper()}", border_style="cyan"))
         elif args.command == "replay":
             from secagents.operational.proof_capsule import ProofCapsuleReplayer
 
@@ -1097,7 +1234,7 @@ def main() -> None:
                 Panel(msg, title="PROOF CAPSULE REPLAY VERIFICATION", border_style=border)
             )
     except KeyboardInterrupt:
-        console.print("\n[warning]⚠ Mission aborted by operator.[/warning]")
+        console.print("\n[warning]Mission aborted by operator.[/warning]")
         sys.exit(130)
 
 

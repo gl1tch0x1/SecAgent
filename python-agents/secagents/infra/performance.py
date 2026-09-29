@@ -5,7 +5,7 @@ import psutil
 import logging
 from functools import wraps
 from typing import Callable, Any, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ class PerformanceMonitor:
                         {
                             "duration_ms": duration,
                             "memory_mb": memory_delta,
-                            "timestamp": datetime.utcnow(),
+                            "timestamp": datetime.now(timezone.utc),
                         }
                     )
 
@@ -74,7 +74,7 @@ class PerformanceMonitor:
                         {
                             "duration_ms": duration,
                             "memory_mb": memory_delta,
-                            "timestamp": datetime.utcnow(),
+                            "timestamp": datetime.now(timezone.utc),
                         }
                     )
 

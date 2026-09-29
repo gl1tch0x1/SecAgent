@@ -4,7 +4,7 @@ import logging
 import json
 import traceback
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
 from pathlib import Path
 from enum import Enum
@@ -26,7 +26,7 @@ class JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON."""
         log_obj = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),

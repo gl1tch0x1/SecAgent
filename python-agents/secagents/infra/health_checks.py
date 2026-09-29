@@ -1,11 +1,12 @@
 """Health check and monitoring endpoints for SecAgents."""
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any
 from enum import Enum
 import logging
 import os
+import time
 
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
@@ -27,7 +28,7 @@ class HealthCheck:
     """Health check for SecAgents system."""
 
     def __init__(self):
-        self.startup_time = datetime.utcnow()
+        self.startup_time = datetime.now(timezone.utc)
         self.checks = {
             "api": self._check_api,
             "database": self._check_database,
@@ -54,14 +55,17 @@ class HealthCheck:
             if not db_url:
                 return {"status": HealthStatus.DEGRADED, "error": "DATABASE_URL not configured"}
 
-            # Try to connect
+            started = time.monotonic()
             conn = await asyncio.wait_for(asyncpg.connect(db_url), timeout=5.0)
+            try:
+                await conn.fetchval("SELECT 1")
+            finally:
+                await conn.close()
 
-            # Run simple query
-            await conn.fetchval("SELECT 1")
-            await conn.close()
-
-            return {"status": HealthStatus.HEALTHY, "connection_time_ms": 10}
+            return {
+                "status": HealthStatus.HEALTHY,
+                "connection_time_ms": round((time.monotonic() - started) * 1000, 2),
+            }
         except asyncio.TimeoutError:
             return {"status": HealthStatus.UNHEALTHY, "error": "Database connection timeout"}
         except Exception as e:
@@ -76,14 +80,18 @@ class HealthCheck:
 
             redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+            started = time.monotonic()
             r = redis.from_url(redis_url)
-
-            # Try ping
-            pong = await asyncio.wait_for(r.ping(), timeout=5.0)
-            await r.close()
+            try:
+                pong = await asyncio.wait_for(r.ping(), timeout=5.0)
+            finally:
+                await r.aclose()
 
             if pong:
-                return {"status": HealthStatus.HEALTHY, "connection_time_ms": 5}
+                return {
+                    "status": HealthStatus.HEALTHY,
+                    "connection_time_ms": round((time.monotonic() - started) * 1000, 2),
+                }
             return {"status": HealthStatus.UNHEALTHY, "error": "Redis ping returned false"}
         except asyncio.TimeoutError:
             return {"status": HealthStatus.UNHEALTHY, "error": "Redis connection timeout"}
@@ -124,8 +132,8 @@ class HealthCheck:
 
         return {
             "status": overall,
-            "timestamp": datetime.utcnow().isoformat(),
-            "uptime_seconds": (datetime.utcnow() - self.startup_time).total_seconds(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "uptime_seconds": (datetime.now(timezone.utc) - self.startup_time).total_seconds(),
             "services": results,
         }
 
@@ -134,38 +142,51 @@ class Metrics:
     """System metrics collection."""
 
     def __init__(self):
-        self.startup_time = datetime.utcnow()
+        self.startup_time = datetime.now(timezone.utc)
         self.total_scans = 0
         self.completed_scans = 0
         self.failed_scans = 0
         self.active_scans = 0
         self.total_findings = 0
         self.total_requests = 0
-        self.last_updated = datetime.utcnow()
+        self.last_updated = datetime.now(timezone.utc)
+        self._scan_starts: list[float] = []
+        self._finished_scan_seconds = 0.0
 
     def record_scan_start(self):
         """Record scan start."""
         self.active_scans += 1
         self.total_scans += 1
+        self._scan_starts.append(time.monotonic())
+        self.last_updated = datetime.now(timezone.utc)
 
     def record_scan_completion(self, findings_count: int):
         """Record scan completion."""
+        if self.active_scans <= 0:
+            return
         self.active_scans -= 1
         self.completed_scans += 1
-        self.total_findings += findings_count
+        self.total_findings += max(0, findings_count)
+        self._finished_scan_seconds += max(0.0, time.monotonic() - self._scan_starts.pop(0))
+        self.last_updated = datetime.now(timezone.utc)
 
     def record_scan_failure(self):
         """Record scan failure."""
+        if self.active_scans <= 0:
+            return
         self.active_scans -= 1
         self.failed_scans += 1
+        self._finished_scan_seconds += max(0.0, time.monotonic() - self._scan_starts.pop(0))
+        self.last_updated = datetime.now(timezone.utc)
 
     def record_request(self):
         """Record API request."""
         self.total_requests += 1
+        self.last_updated = datetime.now(timezone.utc)
 
     def get_metrics(self) -> Dict[str, Any]:
         """Get current metrics."""
-        uptime = (datetime.utcnow() - self.startup_time).total_seconds()
+        uptime = (datetime.now(timezone.utc) - self.startup_time).total_seconds()
 
         return {
             "uptime_seconds": uptime,
@@ -174,13 +195,13 @@ class Metrics:
             "failed_scans": self.failed_scans,
             "active_scans": self.active_scans,
             "avg_scan_duration_seconds": (
-                uptime / (self.completed_scans + self.failed_scans)
+                self._finished_scan_seconds / (self.completed_scans + self.failed_scans)
                 if (self.completed_scans + self.failed_scans) > 0
                 else 0
             ),
             "total_findings": self.total_findings,
             "total_requests": self.total_requests,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
 
@@ -279,19 +300,22 @@ class AgentHealthTracker:
 
     def __init__(self):
         self.agents = {
-            "supervisor": {"status": HealthStatus.HEALTHY, "last_heartbeat": datetime.utcnow()},
-            "planner": {"status": HealthStatus.HEALTHY, "last_heartbeat": datetime.utcnow()},
-            "recon": {"status": HealthStatus.HEALTHY, "last_heartbeat": datetime.utcnow()},
-            "web_security": {"status": HealthStatus.HEALTHY, "last_heartbeat": datetime.utcnow()},
-            "api_security": {"status": HealthStatus.HEALTHY, "last_heartbeat": datetime.utcnow()},
-            "validator": {"status": HealthStatus.HEALTHY, "last_heartbeat": datetime.utcnow()},
-            "report": {"status": HealthStatus.HEALTHY, "last_heartbeat": datetime.utcnow()},
+            name: {"status": HealthStatus.DEGRADED, "last_heartbeat": None}
+            for name in (
+                "supervisor",
+                "planner",
+                "recon",
+                "web_security",
+                "api_security",
+                "validator",
+                "report",
+            )
         }
 
     def record_heartbeat(self, agent_name: str):
         """Record agent heartbeat."""
         if agent_name in self.agents:
-            self.agents[agent_name]["last_heartbeat"] = datetime.utcnow()
+            self.agents[agent_name]["last_heartbeat"] = datetime.now(timezone.utc)
             self.agents[agent_name]["status"] = HealthStatus.HEALTHY
 
     def record_failure(self, agent_name: str):
@@ -307,14 +331,15 @@ class AgentHealthTracker:
         agent = self.agents[agent_name]
 
         # Check if heartbeat is stale (> 30 seconds)
-        age = (datetime.utcnow() - agent["last_heartbeat"]).total_seconds()
-        if age > 30:
+        heartbeat = agent["last_heartbeat"]
+        age = (datetime.now(timezone.utc) - heartbeat).total_seconds() if heartbeat else None
+        if age is not None and age > 30 and agent["status"] == HealthStatus.HEALTHY:
             agent["status"] = HealthStatus.DEGRADED
 
         return {
             "name": agent_name,
             "status": agent["status"],
-            "last_heartbeat": agent["last_heartbeat"].isoformat(),
+            "last_heartbeat": heartbeat.isoformat() if heartbeat else None,
             "heartbeat_age_seconds": age,
         }
 
