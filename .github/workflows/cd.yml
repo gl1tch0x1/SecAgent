@@ -62,7 +62,7 @@ jobs:
 
       - name: Build and push API image
         id: build-api
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: api/Dockerfile
