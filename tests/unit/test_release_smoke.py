@@ -583,3 +583,129 @@ async def test_llm_ollama_uses_local_host_without_a_cloud_key(monkeypatch):
         assert (await llm.complete([LLMMessage("user", "test")])).content == "local-ok"
     assert requests[0].url == "http://localhost:11434/api/chat"
     assert "authorization" not in requests[0].headers
+
+
+def test_installer_reuses_saved_llm_key_and_ignores_placeholders(tmp_path, monkeypatch):
+    import installer
+
+    env_path = tmp_path / ".env"
+    monkeypatch.setattr(installer, "ENV_FILE", env_path)
+    env_path.write_text(
+        "SECAGENT_LLM_PROVIDER=deepseek\nDEEPSEEK_API_KEY=sk-real-test-key\n",
+        encoding="utf-8",
+    )
+    assert installer._saved_llm_provider() == "deepseek"
+    env_path.write_text("OPENAI_API_KEY=sk-...\n", encoding="utf-8")
+    assert installer._saved_llm_provider() is None
+
+
+def test_reinstall_with_saved_llm_does_not_ask_for_key(tmp_path, monkeypatch):
+    import installer
+
+    class FakeLive:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def update(self, *args):
+            pass
+
+    class FakeConsole:
+        is_terminal = False
+
+        def print(self, *args, **kwargs):
+            pass
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "SECAGENT_LLM_PROVIDER=deepseek\nDEEPSEEK_API_KEY=sk-saved-test-key\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer, "ENV_FILE", env_path)
+    monkeypatch.setattr(installer, "Live", FakeLive)
+    monkeypatch.setattr(installer, "console", FakeConsole())
+    monkeypatch.setattr(
+        installer.sys, "stdin", type("TTY", (), {"isatty": lambda self: True})()
+    )
+    monkeypatch.setattr(installer.sys, "argv", ["installer.py", "--no-test"])
+    for name in (
+        "run_preflight",
+        "deploy_environment",
+        "install_arsenal",
+        "configure_intel",
+        "create_entrypoints",
+    ):
+        monkeypatch.setattr(installer, name, lambda *args: True)
+    monkeypatch.setattr(installer, "print_final_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        installer,
+        "configure_llm_interactive",
+        lambda: pytest.fail("Prompted for a saved key"),
+    )
+    assert installer.main() == 0
+
+
+def test_role_prompts_include_new_hunting_skills_without_full_global_guide():
+    from secagents.core.skill_manager import skill_manager
+
+    names = skill_manager.available_skills()
+    assert {
+        "HuntPlanning",
+        "APIAssessment",
+        "BusinessLogic",
+        "EvidenceValidation",
+    } <= set(names)
+    api_prompt = skill_manager.apply_to_prompt("Base", "api_security")
+    assert "API Assessment" in api_prompt
+    assert "state read" in api_prompt
+    assert len(api_prompt) < 6000
+    assert skill_manager.get_skill("apiassessment") == skill_manager.get_skill(
+        "APIAssessment"
+    )
+
+
+@pytest.mark.asyncio
+async def test_hunt_plan_uses_scope_and_selected_skill_without_live_target_requests(
+    monkeypatch, capsys
+):
+    import json
+    from secagents import cli
+    from secagents.llm import omni
+
+    monkeypatch.setenv("ALLOWED_DOMAINS", "app.example")
+    monkeypatch.delenv("BLOCKED_DOMAINS", raising=False)
+    captured = []
+
+    class FakeLLM:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def complete(self, messages, **kwargs):
+            captured.extend(messages)
+            return omni.LLMResponse(
+                content=json.dumps({"hypotheses": [], "scope": ["app.example"]}),
+                provider="test",
+                model="test-model",
+            )
+
+    monkeypatch.setattr(omni, "OmniLLM", FakeLLM)
+    args = cli.build_parser().parse_args(
+        ["hunt-plan", "-t", "app.example", "--focus", "api", "--request-budget", "10"]
+    )
+    assert await cli.cmd_hunt_plan(args) == 0
+    assert "API Assessment" in captured[0].content
+    assert "10" in captured[1].content
+    assert "hypotheses" in capsys.readouterr().out
+
+    captured.clear()
+    args.target = "outside.example"
+    assert await cli.cmd_hunt_plan(args) == 2
+    assert captured == []

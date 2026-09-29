@@ -400,7 +400,7 @@ python installer.py --allowed-domains app.example
 
 The installer uses a compact live terminal display and clears it before showing the final command list. It creates `.env` without authorizing a target by default. Use `--allowed-domains` during setup or `./secagent scope --add DOMAIN` afterward; scans remain blocked until the target is explicitly allowed. On Windows, use `.\secagent.bat` in place of `./secagent`. Run `./secagent --help` to verify the entrypoint.
 
-In an interactive terminal, installation asks **Yes / Skip** for LLM setup. Yes offers OpenAI, Claude, DeepSeek, Gemini, Ollama, and Other. Enter the provider's model ID; cloud keys are entered without terminal echo. Ollama uses a local host and does not require a key. Other expects an OpenAI-compatible chat-completions endpoint URL (including its route), model ID, provider name, and Bearer API key. Remote endpoints must use HTTPS; loopback HTTP is allowed. The installer saves the selected primary provider in the ignored local `.env` with owner-only permissions on Unix. It does not send a test prompt or validate a paid key during installation. For automated installs, use `python installer.py --skip-llm-setup`.
+In an interactive terminal, installation asks **Yes / Skip** for LLM setup when no saved provider configuration exists. Yes offers OpenAI, Claude, DeepSeek, Gemini, Ollama, and Other. Enter the provider's model ID; cloud keys are entered without terminal echo. Ollama uses a local host and does not require a key. Other expects an OpenAI-compatible chat-completions endpoint URL (including its route), model ID, provider name, and Bearer API key. Remote endpoints must use HTTPS; loopback HTTP is allowed. The installer saves the selected primary provider in the ignored local `.env` with owner-only permissions on Unix and reuses it on later installs or updates. Use `python installer.py --configure-llm` to replace that selection, or `--skip-llm-setup` for automation. The installer does not send a test prompt or validate a paid key.
 
 ### Method 2 — Manual Package Installation
 
@@ -499,19 +499,30 @@ Set `SECAGENT_LLM_PROVIDER` to `openai`, `anthropic` (Claude), `deepseek`, `goog
 
 ```text
 usage: secagent [-h] [--version]
-                {scan,vault,keyhacks,preflight,update,hardware,worker} ...
+                {scan,fuzz,vault,keyhacks,preflight,skills,hunt-plan,scope,update,hardware,worker,tools,memory,agents,ctf,mcp,playbook,replay} ...
 
 SecAgent — Autonomous Offensive AI Framework (authorized testing only)
 
 positional arguments:
-  {scan,vault,keyhacks,preflight,update,hardware,worker}
+  {scan,fuzz,vault,keyhacks,preflight,skills,hunt-plan,scope,update,hardware,worker,tools,memory,agents,ctf,mcp,playbook,replay}
     scan                Execute autonomous red-team pipeline
+    fuzz                Fuzz local binaries or preview HTTP payload variants
     vault               Interface with secret storage and API keys
     keyhacks            Scan local assets for leaked credentials
     preflight           Validate system readiness
-    update              Check and apply framework updates
+    skills              List or inspect hunting skill modules
+    hunt-plan           Generate a scoped, evidence-first hunting plan
+    scope               Manage the explicit scan target allowlist
+    update              Check and safely apply main branch updates
     hardware            Hardware-aware model optimization
     worker              Start background workflow processor
+    tools               Browse the integrated security tools catalog
+    memory              Inspect and query Aura Cognitive Memory
+    agents              List specialized AI swarm agents
+    ctf                 Execute CTF challenge solver pipeline
+    mcp                 Run the Model Context Protocol server
+    playbook            Execute a declarative methodology playbook
+    replay              Replay a proof capsule against a target
 
 options:
   -h, --help            show this help message and exit
@@ -549,6 +560,8 @@ Options:
 ```
 
 The bounded default scan meters built-in HTTP requests and configured Shodan/Chaos provider requests. Optional external binaries remain disabled because their internal traffic cannot be metered by this budget. Browser discovery and XSS proof require Playwright and Chromium. The scan handlers run on the host; use an operator-managed container or virtual machine when runtime isolation is required. Reports record consumed budget, termination reason, findings, manual leads, and coverage gaps.
+
+Inspect the hunting skills with `secagent skills` or `secagent skills --show APIAssessment`. `secagent hunt-plan -t app.example --focus api --request-budget 100` uses the saved primary LLM to generate a scoped, evidence-first plan. Other focuses are `recon`, `web`, `business`, `ai`, and `proof`. This command sends one prompt to the configured LLM service and performs no target probes; the plan contains hypotheses, not findings. A saved key is reused automatically. The role prompts now load matching modular skills for reconnaissance, web, API, business logic, planning, AI, and evidence review.
 
 ### Bounded fuzzing
 

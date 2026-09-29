@@ -329,6 +329,44 @@ def _save_llm_config(values: dict[str, str]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _saved_llm_provider() -> str | None:
+    """Return the configured provider without exposing or testing its credential."""
+    if not ENV_FILE.is_file():
+        return None
+    settings = dict(
+        line.partition("=")[::2]
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines()
+        if "=" in line and not line.lstrip().startswith("#")
+    )
+
+    def present(name: str) -> bool:
+        value = settings.get(name, "").strip().strip("\"'")
+        return bool(value) and "..." not in value and not value.startswith("replace-")
+
+    provider = settings.get("SECAGENT_LLM_PROVIDER", "").strip().lower()
+    named = {item[0]: item[2] for item in LLM_PROVIDERS.values() if item[2]}
+    if provider == "ollama" and present("OLLAMA_HOST"):
+        return provider
+    if provider == "custom" and all(
+        present(name)
+        for name in (
+            "SECAGENT_LLM_API_KEY",
+            "SECAGENT_LLM_MODEL",
+            "SECAGENT_LLM_ENDPOINT",
+        )
+    ):
+        return provider
+    if provider in named and present(named[provider]):
+        return provider
+    if not provider:
+        for name, key_name in named.items():
+            if name != "custom" and present(key_name):
+                return name
+        if present("OLLAMA_HOST"):
+            return "ollama"
+    return None
+
+
 def configure_llm_interactive() -> bool:
     """Collect one primary LLM configuration without echoing or logging secrets."""
     try:
@@ -547,10 +585,14 @@ def main():
     parser.add_argument("--docker", action="store_true")
     parser.add_argument("--no-test", action="store_true")
     parser.add_argument("--no-start", action="store_true")
-    parser.add_argument(
-        "--skip-llm-setup",
+    llm_options = parser.add_mutually_exclusive_group()
+    llm_options.add_argument(
+        "--skip-llm-setup", action="store_true", help="Skip interactive LLM setup"
+    )
+    llm_options.add_argument(
+        "--configure-llm",
         action="store_true",
-        help="Skip the interactive LLM provider setup",
+        help="Replace the saved primary LLM setup",
     )
     parser.add_argument(
         "--allowed-domains",
@@ -600,8 +642,20 @@ def main():
 
     if console.is_terminal:
         console.clear()
+    if overall_success and args.configure_llm and not sys.stdin.isatty():
+        console.print(
+            "[error]--configure-llm requires an interactive terminal.[/error]"
+        )
+        overall_success = False
     if overall_success and not args.skip_llm_setup and sys.stdin.isatty():
-        overall_success = configure_llm_interactive()
+        saved = _saved_llm_provider()
+        if saved and not args.configure_llm:
+            console.print(
+                f"[success]Saved {saved} LLM configuration detected.[/success] "
+                "Use --configure-llm to change it."
+            )
+        else:
+            overall_success = configure_llm_interactive()
     print_final_report(overall_success, verified=not args.no_test)
     return 0 if overall_success else 1
 

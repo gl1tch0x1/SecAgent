@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Any
 
+import httpx
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
@@ -267,6 +268,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Infrastructure Commands
     sub.add_parser("preflight", help="Validate system readiness")
+    skills = sub.add_parser("skills", help="List or inspect hunting skill modules")
+    skills.add_argument("--show", metavar="NAME", help="Display one skill module")
+    hunt = sub.add_parser("hunt-plan", help="Generate a scoped, evidence-first hunting plan")
+    hunt.add_argument("--target", "-t", required=True, help="Approved target domain or URL")
+    hunt.add_argument(
+        "--focus",
+        choices=["recon", "web", "api", "business", "ai", "proof"],
+        default="web",
+        help="Hunting surface to prioritize",
+    )
+    hunt.add_argument(
+        "--request-budget",
+        type=int,
+        default=100,
+        help="Maximum target requests to propose in the plan (no probes are run)",
+    )
     scope = sub.add_parser("scope", help="Manage the explicit scan target allowlist")
     scope.add_argument(
         "--add",
@@ -715,16 +732,12 @@ async def cmd_vault(args: argparse.Namespace) -> int:
         from secagents.vault.env_loader import KeyReport, KeyStatus, mask_secret
 
         v.reports = []
-        for name in (
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "GROQ_API_KEY",
-            "DEEPSEEK_API_KEY",
-            "LLM_API_KEYS",
-        ):
-            val = os.environ.get(name, "")
-            status = KeyStatus.PRESENT if val else KeyStatus.MISSING
-            v.reports.append(KeyReport(name, status, mask_secret(val) if val else ""))
+        for name, value in v._collect_llm_keys():
+            v.reports.append(KeyReport(name, KeyStatus.PRESENT, mask_secret(value)))
+        if os.environ.get("SECAGENT_LLM_PROVIDER") == "ollama" and os.environ.get("OLLAMA_HOST"):
+            v.reports.append(KeyReport("OLLAMA_HOST", KeyStatus.PRESENT, "local endpoint"))
+        if not v.reports:
+            v.reports.append(KeyReport("LLM_PROVIDER", KeyStatus.MISSING, ""))
 
     # Enhanced Vault Table
     table = Table(
@@ -754,6 +767,74 @@ async def cmd_vault(args: argparse.Namespace) -> int:
 
     console.print(table)
     return 0
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    from secagents.core.skill_manager import skill_manager
+
+    if args.show:
+        content = skill_manager.get_skill(args.show)
+        if content is None:
+            console.print(f"[error]Unknown skill: {args.show}[/error]")
+            return 2
+        console.print(Text(content))
+        return 0
+
+    table = Table(title="HUNTING SKILLS", box=ROUNDED)
+    table.add_column("MODULE", style="cyan")
+    for name in skill_manager.available_skills():
+        table.add_row(name)
+    console.print(table)
+    return 0
+
+
+async def cmd_hunt_plan(args: argparse.Namespace) -> int:
+    from secagents.core.skill_manager import skill_manager
+    from secagents.llm.omni import LLMMessage, OmniLLM
+    from secagents.prompts import HUNT_PLAN_PROMPT
+
+    if not 1 <= args.request_budget <= 10000:
+        console.print("[error]--request-budget must be between 1 and 10000.[/error]")
+        return 2
+    try:
+        enforce_scope(args.target)
+        modules = {
+            "recon": "Recon",
+            "web": "WebAssessment",
+            "api": "APIAssessment",
+            "business": "BusinessLogic",
+            "ai": "PromptInjection",
+            "proof": "EvidenceValidation",
+        }
+        system = skill_manager.apply_to_prompt(HUNT_PLAN_PROMPT, modules[args.focus])
+        request = (
+            f"Approved target: {args.target}\nFocus: {args.focus}\n"
+            f"Maximum HTTP requests in the proposed plan: {args.request_budget}. "
+            "Plan only; do not execute network probes."
+        )
+        async with OmniLLM() as llm:
+            response = await llm.complete(
+                [LLMMessage("system", system), LLMMessage("user", request)],
+                max_tokens=1600,
+            )
+        try:
+            plan = json.loads(response.content)
+            if not isinstance(plan, dict) or not isinstance(plan.get("hypotheses"), list):
+                raise ValueError("Plan lacks a hypotheses list")
+        except (json.JSONDecodeError, ValueError):
+            console.print("[warning]Provider response was not a structured plan.[/warning]")
+            return 2
+        plan["_secagent"] = {
+            "status": "hypotheses_only",
+            "approved_target": args.target,
+            "proposed_request_cap": args.request_budget,
+            "target_requests_sent": 0,
+        }
+        console.print_json(data=plan)
+        return 0
+    except (ScopeViolationError, ValueError, RuntimeError, httpx.HTTPError) as exc:
+        console.print(f"[error]Hunt plan unavailable: {exc}[/error]")
+        return 2
 
 
 async def cmd_keyhacks(args: argparse.Namespace) -> int:
@@ -817,6 +898,9 @@ def main() -> None:
     if args.command == "scope":
         sys.exit(cmd_scope(args))
 
+    if args.command == "skills":
+        sys.exit(cmd_skills(args))
+
     logger = configure_logging(args.log_level, args.json_output)
     metrics = MetricsCollector()
     metrics.increment("cli_invocations")
@@ -834,6 +918,8 @@ def main() -> None:
     try:
         if args.command == "scan":
             sys.exit(asyncio.run(cmd_scan_batch(args) if args.targets_file else cmd_scan(args)))
+        elif args.command == "hunt-plan":
+            sys.exit(asyncio.run(cmd_hunt_plan(args)))
         elif args.command == "vault":
             sys.exit(asyncio.run(cmd_vault(args)))
         elif args.command == "keyhacks":
