@@ -51,7 +51,7 @@ jobs:
 
       - name: Install ruff
         if: matrix.language == 'python'
-        run: pip install ruff
+        run: pip install ruff==0.15.15
 
       - name: Run ruff check
         if: matrix.language == 'python'

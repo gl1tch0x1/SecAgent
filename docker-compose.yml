@@ -1,6 +1,19 @@
-version: "3.9"
-
 services:
+  api:
+    image: ${SECAGENT_API_IMAGE:-ghcr.io/gl1tch0x1/secagent/api:latest}
+    build: { context: ., dockerfile: python-agents/Dockerfile }
+    command: ["python", "-m", "uvicorn", "secagents.infra.health_checks:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-secagents_redis}@redis:6379/0
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 10s
+      timeout: 7s
+      retries: 3
+
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-secagents_redis}", "--appendonly", "yes"]

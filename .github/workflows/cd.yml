@@ -65,7 +65,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: api/Dockerfile
+          file: python-agents/Dockerfile
           push: true
           tags: ${{ steps.meta-api.outputs.tags }}
           labels: ${{ steps.meta-api.outputs.labels }}
@@ -85,7 +85,7 @@ jobs:
     environment:
       name: staging
       url: ${{ vars.STAGING_URL }}
-    if: ${{ github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging' }}
+    if: ${{ vars.STAGING_SSH_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging') }}
 
     steps:
       - name: Checkout repository
@@ -93,18 +93,19 @@ jobs:
 
       - name: Deploy via Docker Compose (SSH)
         uses: appleboy/ssh-action@v1
-        if: ${{ vars.STAGING_SSH_ENABLED == 'true' }}
         with:
           host: ${{ secrets.STAGING_SSH_HOST }}
           username: ${{ secrets.STAGING_SSH_USER }}
           key: ${{ secrets.STAGING_SSH_KEY }}
           port: ${{ secrets.STAGING_SSH_PORT || 22 }}
           script: |
+            set -e
             cd /opt/secagents
+            git pull --ff-only origin main
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             docker compose pull api
-            docker compose up -d api
-            docker compose exec -T postgres pg_isready -U secagents
+            docker compose up -d --wait api
+            curl --fail --silent --show-error http://127.0.0.1:8000/health
             echo "Deploy complete: $(date)"
 
       - name: Smoke test staging health endpoint
@@ -135,7 +136,7 @@ jobs:
     name: "Post-Deploy Integration Tests"
     runs-on: ubuntu-latest
     needs: deploy-staging
-    if: ${{ vars.STAGING_URL != '' }}
+    if: ${{ needs.deploy-staging.result == 'success' && vars.STAGING_URL != '' }}
 
     steps:
       - name: Checkout repository
@@ -158,9 +159,8 @@ jobs:
           
           tests = [
               ('GET', '/health', 200),
-              ('GET', '/targets', 200),
-              ('GET', '/workflows', 200),
-              ('GET', '/findings', 200),
+              ('GET', '/v1/agents', 200),
+              ('GET', '/v1/metrics', 200),
           ]
           
           passed = 0
@@ -200,22 +200,22 @@ jobs:
           key: ${{ secrets.PRODUCTION_SSH_KEY }}
           port: ${{ secrets.PRODUCTION_SSH_PORT || 22 }}
           script: |
+            set -e
             cd /opt/secagents
+            git pull --ff-only origin main
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            # Keep previous image for rollback
-            docker tag secagents/api:current secagents/api:rollback 2>/dev/null || true
+            API_REPO=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
+            API_IMAGE="ghcr.io/$API_REPO/api:latest"
+            ROLLBACK_IMAGE="ghcr.io/$API_REPO/api:rollback"
+            docker image inspect "$API_IMAGE" >/dev/null 2>&1 && docker tag "$API_IMAGE" "$ROLLBACK_IMAGE" || true
             docker compose pull api
-            docker compose up -d api
-            sleep 10
-            # Health check — rollback on failure
-            if ! curl -sf http://localhost:8000/health > /dev/null; then
+            if ! docker compose up -d --wait api || ! curl -sf http://127.0.0.1:8000/health > /dev/null; then
               echo "Health check failed — rolling back"
-              docker compose down api
-              docker tag secagents/api:rollback secagents/api:current
-              docker compose up -d api
+              if docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+                SECAGENT_API_IMAGE="$ROLLBACK_IMAGE" docker compose up -d --wait --force-recreate api
+              fi
               exit 1
             fi
-            docker tag secagents/api:latest secagents/api:current
             echo "Production deploy complete: $(date)"
 
       - name: Verify production health

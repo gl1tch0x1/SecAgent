@@ -10,6 +10,8 @@ import os
 from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 
+from secagents import __version__
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +39,7 @@ class HealthCheck:
         """Check API health."""
         try:
             # API is running if we can check it
-            return {"status": HealthStatus.HEALTHY, "response_time_ms": 1, "version": "0.2.0"}
+            return {"status": HealthStatus.HEALTHY, "version": __version__}
         except Exception as e:
             logger.error(f"API health check failed: {e}")
             return {"status": HealthStatus.UNHEALTHY, "error": str(e)}
@@ -92,9 +94,10 @@ class HealthCheck:
     async def _check_orchestrator(self) -> Dict[str, Any]:
         """Check orchestrator health."""
         try:
-            # Check if orchestrator is running
-            # This would connect to orchestrator service
-            return {"status": HealthStatus.HEALTHY, "tasks_queued": 0, "workers_active": 2}
+            return {
+                "status": HealthStatus.DEGRADED,
+                "reason": "Orchestrator status is not connected",
+            }
         except Exception as e:
             logger.error(f"Orchestrator health check failed: {e}")
             return {"status": HealthStatus.DEGRADED, "error": str(e)}
@@ -193,7 +196,7 @@ async def health():
     """System health check endpoint."""
     result = await health_check.run_all_checks()
 
-    status_code = 200 if result["status"] == HealthStatus.HEALTHY else 503
+    status_code = 503 if result["status"] == HealthStatus.UNHEALTHY else 200
 
     return JSONResponse(result, status_code=status_code)
 

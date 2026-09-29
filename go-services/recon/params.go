@@ -20,8 +20,8 @@ type ParamResult struct {
 
 // ParamDiscovery finds parameters in URLs via reflection and common wordlists.
 type ParamDiscovery struct {
-	Client      *http.Client
-	Concurrency int
+	Client       *http.Client
+	Concurrency  int
 	CommonParams []string
 }
 

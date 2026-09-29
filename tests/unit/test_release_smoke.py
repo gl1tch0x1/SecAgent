@@ -315,3 +315,28 @@ def test_updater_treats_local_ahead_as_no_inbound_update(monkeypatch):
     monkeypatch.setattr(update, "_git", fake_git)
     assert update.main([]) == 0
     assert not any(args[0] == "merge" for args in calls)
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_reports_degraded_without_inventing_readiness(monkeypatch):
+    from secagents.infra import health_checks
+
+    async def degraded():
+        return {"status": health_checks.HealthStatus.DEGRADED, "services": {}}
+
+    monkeypatch.setattr(health_checks.health_check, "run_all_checks", degraded)
+    response = await health_checks.health()
+    assert response.status_code == 200
+    assert b'"status":"degraded"' in response.body
+
+
+def test_deployment_image_paths_exist_and_compose_has_api():
+    import yaml
+
+    root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
+    dockerfile = compose["services"]["api"]["build"]["dockerfile"]
+    assert (root / dockerfile).is_file()
+    workflow = (root / ".github/workflows/cd.yml").read_text(encoding="utf-8")
+    assert f"file: {dockerfile}" in workflow
+    assert "docker compose exec -T postgres" not in workflow

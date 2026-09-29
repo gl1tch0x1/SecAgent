@@ -431,14 +431,18 @@ pip install -e ./python-agents[dev,browser]
 SecAgent is engineered for flexible deployment across local machines, remote servers, and containerized clusters.
 
 #### Docker Compose Deployment
-Run core background microservices (Redis event bus, Rust engine, Go prober):
+Run the local API health service and background components:
 ```bash
 docker compose up -d
 ```
 Container inventory:
+- `api`: FastAPI health and metrics endpoints bound to `127.0.0.1:8000`; `/health` reports degraded when optional services are not configured
 - `redis`: Pub/Sub event bus (`:6379`)
 - `rust-core`: Rust priority task scheduler
 - `recon`: Go high-concurrency network prober
+- `worker`: Python workflow processor
+
+The CD workflow builds the API image from `python-agents/Dockerfile`. Staging deployment runs only when `STAGING_SSH_ENABLED=true` is configured; its smoke tests use the routes implemented by the API.
 
 #### Standalone CLI Binary Deployment
 The installer generates executable binary wrappers for quick invocation:
